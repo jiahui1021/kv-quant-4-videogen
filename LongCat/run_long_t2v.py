@@ -112,6 +112,8 @@ def _write_generation_metrics(args, dit, device, start_time: float, prompt_idx: 
     )
     quantizer = getattr(dit, "kv_quantizer", None)
     stats = getattr(quantizer, "stats", None)
+    if stats is not None and hasattr(stats, "resolve_timing"):
+        stats.resolve_timing(synchronize=False)
     method = getattr(dit, "kv_quant_method", "BF16")
     if method == "BF16" and peak_bf16_kv_bytes:
         peak_compressed_kv_bytes = peak_bf16_kv_bytes
@@ -245,6 +247,8 @@ def generate(args):
         enable_compile,
     )
     method_name, quantizer = parse_method(args.method, block_size=args.block_size)
+    if quantizer is not None:
+        quantizer.set_timing_enabled(args.profile_quant_timing)
     if method_name != "BF16" and args.quant_type != "none":
         raise ValueError(
             "Do not enable shared RTN/KIVI/QuaRot and legacy --quant_type at the same time."
@@ -859,6 +863,11 @@ def _parse_args():
         type=int,
         default=16,
         help="Sequence block size for shared RTN/KIVI/QuaRot KV quantization",
+    )
+    quant_group.add_argument(
+        "--profile_quant_timing",
+        action="store_true",
+        help="Record optional quantize/dequantize CUDA-event breakdowns",
     )
     quant_group.add_argument(
         "--quant_type",

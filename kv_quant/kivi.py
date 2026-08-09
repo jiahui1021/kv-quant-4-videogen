@@ -88,24 +88,27 @@ class KIVIQuantizer(KVQuantizer):
 
     def quantize_kv(self, k, v, meta: Dict[str, Any] | None = None) -> Dict[str, Any]:
         bf16_bytes = int(k.numel() * k.element_size() + v.numel() * v.element_size())
-        with timed(k.device) as t:
+        with timed(k.device, enabled=self.stats.timing_enabled) as t:
             k_state = self._quantize_keys(k)
             v_state = self._quantize_values(v)
             tensor_dtype = (meta or {}).get("tensor_dtype", k.dtype)
             k_state["tensor_dtype"] = tensor_dtype
             v_state["tensor_dtype"] = tensor_dtype
             state = {"k": k_state, "v": v_state}
-        self.stats.quantize_time_s += t[0]
+        self.stats.record_quantize(t)
         self.stats.quantize_calls += 1
         self.stats.bf16_kv_bytes = bf16_bytes
         self.stats.compressed_kv_bytes = self.memory_bytes(state)
         return state
 
     def dequantize_kv(self, state: Dict[str, Any], meta: Dict[str, Any] | None = None) -> Tuple[Any, Any]:
-        with timed(state["k"]["q"].device) as t:
+        with timed(
+            state["k"]["q"].device,
+            enabled=self.stats.timing_enabled,
+        ) as t:
             k = self._dequantize(state["k"])
             v = self._dequantize(state["v"])
-        self.stats.dequantize_time_s += t[0]
+        self.stats.record_dequantize(t)
         self.stats.dequantize_calls += 1
         return k, v
 

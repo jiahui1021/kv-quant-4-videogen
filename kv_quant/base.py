@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, Tuple
+
+import torch
 
 
 @dataclass
@@ -13,6 +15,43 @@ class QuantizerStats:
     dequantize_calls: int = 0
     bf16_kv_bytes: int = 0
     compressed_kv_bytes: int = 0
+    timing_enabled: bool = False
+    _pending_quantize_timers: list[Any] = field(default_factory=list, repr=False)
+    _pending_dequantize_timers: list[Any] = field(default_factory=list, repr=False)
+
+    def record_quantize(self, timer: Any) -> None:
+        if not timer.enabled:
+            return
+        if timer.is_cuda:
+            self._pending_quantize_timers.append(timer)
+        else:
+            self.quantize_time_s += timer.resolve()
+
+    def record_dequantize(self, timer: Any) -> None:
+        if not timer.enabled:
+            return
+        if timer.is_cuda:
+            self._pending_dequantize_timers.append(timer)
+        else:
+            self.dequantize_time_s += timer.resolve()
+
+    def resolve_timing(self, synchronize: bool = True) -> None:
+        """Resolve pending CUDA events, synchronizing at most once per device."""
+        pending = self._pending_quantize_timers + self._pending_dequantize_timers
+        if not pending:
+            return
+
+        if synchronize:
+            devices = {timer.device for timer in pending if timer.device is not None}
+            for device in devices:
+                torch.cuda.synchronize(device)
+
+        for timer in self._pending_quantize_timers:
+            self.quantize_time_s += timer.resolve()
+        for timer in self._pending_dequantize_timers:
+            self.dequantize_time_s += timer.resolve()
+        self._pending_quantize_timers.clear()
+        self._pending_dequantize_timers.clear()
 
 
 class KVQuantizer(ABC):
@@ -43,7 +82,11 @@ class KVQuantizer(ABC):
         return self._name
 
     def reset_stats(self) -> None:
-        self.stats = QuantizerStats()
+        self.stats = QuantizerStats(timing_enabled=self.stats.timing_enabled)
+
+    def set_timing_enabled(self, enabled: bool) -> None:
+        """Enable optional quantize/dequantize timing breakdowns."""
+        self.stats.timing_enabled = bool(enabled)
 
     @abstractmethod
     def quantize_kv(self, k, v, meta: Dict[str, Any] | None = None) -> Dict[str, Any]:

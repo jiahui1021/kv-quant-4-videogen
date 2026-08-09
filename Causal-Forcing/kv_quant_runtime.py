@@ -106,26 +106,29 @@ def reset_quantized_kv_cache(pipeline) -> None:
                 block["v"].zero_()
 
 
-def active_kv_memory_bytes(pipeline, quantizer=None) -> tuple[int, int]:
-    """Return active BF16-equivalent and compressed cache bytes."""
+def resident_kv_memory_bytes(pipeline, quantizer=None) -> tuple[int, int]:
+    """Return BF16 and compressed bytes for the resident cache capacity."""
     bf16_bytes = 0
     compressed_bytes = 0
     for cache_list in _cache_lists(pipeline):
         for block in cache_list:
-            active_tokens = int(block["local_end_index"].item())
             cache_k = block.get("k")
             if isinstance(cache_k, torch.Tensor) and cache_k.ndim == 4:
-                batch_size, _, num_heads, head_dim = cache_k.shape
+                batch_size, tensor_capacity, num_heads, head_dim = cache_k.shape
                 element_size = cache_k.element_size()
             else:
+                tensor_capacity = 0
                 batch_size = int(block.get("batch_size", 0))
                 num_heads = int(block.get("num_heads", 0))
                 head_dim = int(block.get("head_dim", 0))
                 dtype = block.get("dtype", torch.bfloat16)
                 element_size = torch.empty((), dtype=dtype).element_size()
-            block_bf16_bytes = (
-                batch_size * active_tokens * num_heads * head_dim * element_size * 2
+
+            configured_capacity = block.get("kv_cache_size")
+            capacity_tokens = int(
+                tensor_capacity if configured_capacity is None else configured_capacity
             )
+            block_bf16_bytes = batch_size * capacity_tokens * num_heads * head_dim * element_size * 2
             bf16_bytes += block_bf16_bytes
             state = block.get("quant_state")
             if state is not None and quantizer is not None:
@@ -133,3 +136,8 @@ def active_kv_memory_bytes(pipeline, quantizer=None) -> tuple[int, int]:
             else:
                 compressed_bytes += block_bf16_bytes
     return int(bf16_bytes), int(compressed_bytes)
+
+
+def active_kv_memory_bytes(pipeline, quantizer=None) -> tuple[int, int]:
+    """Backward-compatible alias for resident-capacity accounting."""
+    return resident_kv_memory_bytes(pipeline, quantizer)

@@ -601,6 +601,9 @@ def run(args: argparse.Namespace) -> None:
         args.spatial_target_foreground_ratio,
     )
 
+    if quantizer is not None and hasattr(quantizer, "set_timing_enabled"):
+        quantizer.set_timing_enabled(args.profile_quant_timing)
+
     results_root = args.results_root if args.results_root.is_absolute() else (REPO_ROOT / args.results_root)
     output_dir = results_root / "videos" / method_name
     logs_dir = results_root / "logs"
@@ -917,6 +920,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--results-root", type=Path, default=REPO_ROOT / "results")
     parser.add_argument("--use-ema", action="store_true", default=True)
     parser.add_argument("--low-memory", action="store_true", help="Enable official dynamic-swap low-memory mode.")
+    parser.add_argument(
+        "--profile-quant-timing",
+        action="store_true",
+        help="Record optional quantize/dequantize CUDA-event breakdowns",
+    )
     parser.add_argument(
         "--log-vram-trace",
         action=argparse.BooleanOptionalAction,

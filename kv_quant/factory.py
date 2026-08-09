@@ -20,6 +20,7 @@ def create_quantizer(
     block_size: int = 16,
     key_bits: int | None = None,
     value_bits: int | None = None,
+    name: str | None = None,
 ):
     """Create one of the shared KV-cache quantizers."""
     method = method.upper()
@@ -31,6 +32,7 @@ def create_quantizer(
             block_size=block_size,
             key_bits=key_bits,
             value_bits=value_bits,
+            name=name,
         )
     if method == "KIVI":
         from .kivi import KIVIQuantizer
@@ -40,6 +42,7 @@ def create_quantizer(
             block_size=block_size,
             key_bits=key_bits,
             value_bits=value_bits,
+            name=name,
         )
     if method == "QUAROT_KV":
         from .quarot_kv import QuaRotKVQuantizer
@@ -49,6 +52,7 @@ def create_quantizer(
             block_size=block_size,
             key_bits=key_bits,
             value_bits=value_bits,
+            name=name,
         )
     raise ValueError(f"Unsupported KV quantization method: {method}")
 

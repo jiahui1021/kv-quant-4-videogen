@@ -186,6 +186,15 @@ Causal-Forcing 指标位置：
 
 `end_to_end_generation_time_s` 覆盖生成调用、解码和视频写入；`peak_vram_bytes` 是该视频生成过程中的最高 CUDA 已分配显存。量化方法如果从未实际触发量化，会直接报错，避免把 BF16 结果误标成量化结果。
 
+为避免影响 latency benchmark，量化器的逐次耗时统计默认关闭，不会在每次量化或反量化时插入同步或事件开销。需要查看 CUDA event 耗时分解时再显式开启：
+
+```bash
+--profile_quant_timing        # LongCat 和 Causal-Forcing
+--profile-quant-timing        # Self-Forcing
+```
+
+Causal-Forcing 的 KV 显存报告统一按预分配 cache capacity 统计 BF16 和压缩结果。
+
 ## 推荐验证顺序
 
 ```text

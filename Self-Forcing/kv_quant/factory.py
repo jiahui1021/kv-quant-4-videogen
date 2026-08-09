@@ -16,8 +16,9 @@ def create_quantizer(method: str, bits: int | None, block_size: int, **kwargs):
     if bits is None:
         raise ValueError(f"bits must be provided for method={method}")
     if method == "RTN":
-        from .rtn import RTNQuantizer
-        return RTNQuantizer(
+        from .shared import create_shared_quantizer
+        return create_shared_quantizer(
+            method="RTN",
             bits=bits,
             block_size=block_size,
             key_bits=kwargs.get("key_bits"),
@@ -25,8 +26,9 @@ def create_quantizer(method: str, bits: int | None, block_size: int, **kwargs):
             name=kwargs.get("name"),
         )
     if method == "KIVI":
-        from .kivi import KIVIQuantizer
-        return KIVIQuantizer(
+        from .shared import create_shared_quantizer
+        return create_shared_quantizer(
+            method="KIVI",
             bits=bits,
             block_size=block_size,
             key_bits=kwargs.get("key_bits"),
@@ -34,8 +36,9 @@ def create_quantizer(method: str, bits: int | None, block_size: int, **kwargs):
             name=kwargs.get("name"),
         )
     if method == "QUAROT_KV":
-        from .quarot_kv import QuaRotKVQuantizer
-        return QuaRotKVQuantizer(
+        from .shared import create_shared_quantizer
+        return create_shared_quantizer(
+            method="QUAROT_KV",
             bits=bits,
             block_size=block_size,
             key_bits=kwargs.get("key_bits"),

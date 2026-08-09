@@ -186,6 +186,15 @@ Causal-Forcing reports are stored under:
 
 `end_to_end_generation_time_s` covers the generation call, decoding, and video writing. `peak_vram_bytes` is the maximum CUDA memory allocated during that video generation. Quantized runs also fail if the quantizer was never called, preventing a mislabeled BF16 run.
 
+Per-quantizer timing is disabled by default so it does not add synchronization or event overhead to the latency benchmark. Enable the optional CUDA-event breakdown only when needed:
+
+```bash
+--profile_quant_timing        # LongCat and Causal-Forcing
+--profile-quant-timing        # Self-Forcing
+```
+
+Causal-Forcing KV memory reports use the resident preallocated cache capacity for both BF16 and compressed values.
+
 ## Recommended validation order
 
 ```text

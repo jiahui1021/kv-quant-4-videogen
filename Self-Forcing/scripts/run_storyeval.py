@@ -319,6 +319,8 @@ def run(args: argparse.Namespace) -> None:
         raise RuntimeError("CUDA is required for StoryEval generation.")
 
     method_name, quantizer, cache_policy = parse_method(args.method, args.bits, args.block_size)
+    if quantizer is not None and hasattr(quantizer, "set_timing_enabled"):
+        quantizer.set_timing_enabled(args.profile_quant_timing)
     out_root = args.out_root if args.out_root.is_absolute() else (REPO_ROOT / args.out_root)
     run_id = args.run_id or f"storyeval_{int(time.time())}"
     run_dir = out_root / run_id
@@ -613,6 +615,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--use_ema", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--low_memory", action="store_true", help="Enable Self-Forcing dynamic swap memory mode.")
+    parser.add_argument(
+        "--profile-quant-timing",
+        action="store_true",
+        help="Record optional quantize/dequantize CUDA-event breakdowns",
+    )
     parser.add_argument("--resume", action="store_true", help="Skip completed per_prompt json/video pairs.")
     parser.add_argument("--vram_sample_interval_s", type=float, default=0.2, help="VRAM trace sampling interval in seconds.")
     parser.add_argument("--vram_max_points", type=int, default=1000, help="Maximum trace samples to store per video.")

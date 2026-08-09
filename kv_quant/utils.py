@@ -81,32 +81,81 @@ def fwht_last_dim(x: torch.Tensor) -> torch.Tensor:
     return y / math.sqrt(n)
 
 
+class TimingResult:
+    """A timer whose CUDA result can be resolved after generation completes."""
+
+    def __init__(
+        self,
+        device: torch.device | str | None = None,
+        enabled: bool = True,
+    ) -> None:
+        self.device = torch.device(device) if device is not None else None
+        self._enabled = bool(enabled)
+        self._use_cuda_events = (
+            self._enabled
+            and self.device is not None
+            and self.device.type == "cuda"
+            and torch.cuda.is_available()
+        )
+        self._start_event = None
+        self._end_event = None
+        self._start_cpu = None
+        self._elapsed_s: float | None = None
+
+    @property
+    def is_cuda(self) -> bool:
+        return self._use_cuda_events
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    def start(self) -> None:
+        if not self._enabled:
+            return
+        if self._use_cuda_events:
+            with torch.cuda.device(self.device):
+                self._start_event = torch.cuda.Event(enable_timing=True)
+                self._end_event = torch.cuda.Event(enable_timing=True)
+                self._start_event.record()
+        else:
+            self._start_cpu = time.perf_counter()
+
+    def stop(self) -> None:
+        if not self._enabled:
+            return
+        if self._use_cuda_events:
+            with torch.cuda.device(self.device):
+                self._end_event.record()
+        else:
+            self._elapsed_s = time.perf_counter() - self._start_cpu
+
+    def resolve(self, synchronize: bool = False) -> float:
+        if not self._enabled:
+            return 0.0
+        if self._elapsed_s is not None:
+            return self._elapsed_s
+        if not self._use_cuda_events:
+            raise RuntimeError("Timer was stopped without a CPU timestamp.")
+        if synchronize:
+            self._end_event.synchronize()
+        self._elapsed_s = self._start_event.elapsed_time(self._end_event) / 1000.0
+        return self._elapsed_s
+
+
 @contextmanager
-def timed(device: torch.device | str | None = None) -> Iterator[list]:
-    """Measure CPU work with a clock and CUDA work with CUDA events."""
-    holder = [0.0]
-    resolved_device = torch.device(device) if device is not None else None
-    use_cuda_events = (
-        resolved_device is not None
-        and resolved_device.type == "cuda"
-        and torch.cuda.is_available()
-    )
+def timed(
+    device: torch.device | str | None = None,
+    enabled: bool = True,
+) -> Iterator[TimingResult]:
+    """Measure work without synchronizing CUDA on every call.
 
-    if use_cuda_events:
-        with torch.cuda.device(resolved_device):
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record()
-            try:
-                yield holder
-            finally:
-                end.record()
-                end.synchronize()
-                holder[0] = start.elapsed_time(end) / 1000.0
-        return
-
-    start = time.perf_counter()
+    CUDA event results are intentionally left unresolved. The caller should
+    resolve them after one generation-level ``torch.cuda.synchronize()``.
+    """
+    timer = TimingResult(device, enabled=enabled)
+    timer.start()
     try:
-        yield holder
+        yield timer
     finally:
-        holder[0] = time.perf_counter() - start
+        timer.stop()

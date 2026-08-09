@@ -30,9 +30,9 @@ from utils.misc import set_seed
 from demo_utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller
 from kv_quant.factory import SUPPORTED_METHODS, parse_method
 from kv_quant_runtime import (
-    active_kv_memory_bytes,
     attach_quantizer_to_pipeline,
     reset_quantized_kv_cache,
+    resident_kv_memory_bytes,
 )
 
 parser = argparse.ArgumentParser()
@@ -58,6 +58,11 @@ parser.add_argument(
     type=int,
     default=16,
     help="Sequence block size for shared RTN/KIVI/QuaRot KV quantization",
+)
+parser.add_argument(
+    "--profile_quant_timing",
+    action="store_true",
+    help="Record optional quantize/dequantize CUDA-event breakdowns",
 )
 args = parser.parse_args()
 
@@ -118,6 +123,7 @@ pipeline.vae.to(device=gpu)
 
 method_name, quantizer = parse_method(args.method, block_size=args.block_size)
 if quantizer is not None:
+    quantizer.set_timing_enabled(args.profile_quant_timing)
     attach_quantizer_to_pipeline(
         pipeline,
         quantizer,
@@ -194,10 +200,12 @@ def _write_metrics(
     torch.cuda.synchronize(device)
     elapsed = time.perf_counter() - start_time
     peak_vram_bytes = _distributed_max_memory(device)
-    bf16_kv_bytes, compressed_kv_bytes = active_kv_memory_bytes(
+    bf16_kv_bytes, compressed_kv_bytes = resident_kv_memory_bytes(
         pipeline, quantizer
     )
     stats = getattr(quantizer, "stats", None)
+    if stats is not None and hasattr(stats, "resolve_timing"):
+        stats.resolve_timing(synchronize=False)
     report = {
         "model": "causal_forcing",
         "method": method_name,
@@ -207,6 +215,10 @@ def _write_metrics(
         "wall_clock_runtime_s": float(elapsed),
         "peak_vram_bytes": peak_vram_bytes,
         "peak_vram_gb": peak_vram_bytes / 1024**3,
+        "resident_bf16_kv_bytes": int(bf16_kv_bytes),
+        "resident_compressed_kv_bytes": int(compressed_kv_bytes),
+        # Keep the previous keys for existing result readers. Their values now
+        # use resident-capacity accounting as well.
         "active_bf16_kv_bytes": int(bf16_kv_bytes),
         "active_compressed_kv_bytes": int(compressed_kv_bytes),
         "compression_ratio": (
