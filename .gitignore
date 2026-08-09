@@ -1,0 +1,6 @@
+# Python generated files
+__pycache__/
+*.py[cod]
+
+# External repository checked out for local use
+Causal-Forcing/
