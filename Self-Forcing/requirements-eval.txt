@@ -1,0 +1,5 @@
+# Evaluation environment (VBench)
+vbench
+scikit-image
+lpips
+matplotlib
