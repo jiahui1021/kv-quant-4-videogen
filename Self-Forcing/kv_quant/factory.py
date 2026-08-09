@@ -17,13 +17,31 @@ def create_quantizer(method: str, bits: int | None, block_size: int, **kwargs):
         raise ValueError(f"bits must be provided for method={method}")
     if method == "RTN":
         from .rtn import RTNQuantizer
-        return RTNQuantizer(bits=bits, block_size=block_size, key_bits=key_bits, value_bits=value_bits, name=name)
+        return RTNQuantizer(
+            bits=bits,
+            block_size=block_size,
+            key_bits=kwargs.get("key_bits"),
+            value_bits=kwargs.get("value_bits"),
+            name=kwargs.get("name"),
+        )
     if method == "KIVI":
         from .kivi import KIVIQuantizer
-        return KIVIQuantizer(bits=bits, block_size=block_size, key_bits=key_bits, value_bits=value_bits, name=name)
+        return KIVIQuantizer(
+            bits=bits,
+            block_size=block_size,
+            key_bits=kwargs.get("key_bits"),
+            value_bits=kwargs.get("value_bits"),
+            name=kwargs.get("name"),
+        )
     if method == "QUAROT_KV":
         from .quarot_kv import QuaRotKVQuantizer
-        return QuaRotKVQuantizer(bits=bits, block_size=block_size)
+        return QuaRotKVQuantizer(
+            bits=bits,
+            block_size=block_size,
+            key_bits=kwargs.get("key_bits"),
+            value_bits=kwargs.get("value_bits"),
+            name=kwargs.get("name"),
+        )
     if method == "PRQ":
         from .prq import PRQQuantizer
         return PRQQuantizer(bits=bits, block_size=block_size, **kwargs)

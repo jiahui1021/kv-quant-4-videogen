@@ -194,10 +194,8 @@ def _write_metrics(
     torch.cuda.synchronize(device)
     elapsed = time.perf_counter() - start_time
     peak_vram_bytes = _distributed_max_memory(device)
-    bf16_kv_bytes, compressed_kv_bytes = (
-        active_kv_memory_bytes(pipeline, quantizer)
-        if quantizer is not None
-        else (0, 0)
+    bf16_kv_bytes, compressed_kv_bytes = active_kv_memory_bytes(
+        pipeline, quantizer
     )
     stats = getattr(quantizer, "stats", None)
     report = {

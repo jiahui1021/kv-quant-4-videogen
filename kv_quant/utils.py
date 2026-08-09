@@ -82,8 +82,29 @@ def fwht_last_dim(x: torch.Tensor) -> torch.Tensor:
 
 
 @contextmanager
-def timed() -> Iterator[list]:
+def timed(device: torch.device | str | None = None) -> Iterator[list]:
+    """Measure CPU work with a clock and CUDA work with CUDA events."""
     holder = [0.0]
+    resolved_device = torch.device(device) if device is not None else None
+    use_cuda_events = (
+        resolved_device is not None
+        and resolved_device.type == "cuda"
+        and torch.cuda.is_available()
+    )
+
+    if use_cuda_events:
+        with torch.cuda.device(resolved_device):
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            try:
+                yield holder
+            finally:
+                end.record()
+                end.synchronize()
+                holder[0] = start.elapsed_time(end) / 1000.0
+        return
+
     start = time.perf_counter()
     try:
         yield holder

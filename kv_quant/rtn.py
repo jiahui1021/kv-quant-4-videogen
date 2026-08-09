@@ -5,6 +5,7 @@ from typing import Any, Dict, Tuple
 import torch
 
 from .base import KVQuantizer
+from .bitpack import pack_bits, unpack_bits
 from .packing import packed_bytes
 from .utils import _reshape_blocks, _unshape_blocks, dequantize_sym, quantize_sym, timed
 
@@ -33,7 +34,11 @@ class RTNQuantizer(KVQuantizer):
         xb, pad_len = _reshape_blocks(x, self.block_size)
         q, scale = quantize_sym(xb, bits=bits, reduce_dims=(2,))
         return {
-            "q": q,
+            "q": pack_bits(q, bits, signed=True),
+            "q_shape": tuple(q.shape),
+            "q_numel": int(q.numel()),
+            "packed": True,
+            "signed": True,
             "scale": scale,
             "pad_len": pad_len,
             "orig_shape": tuple(x.shape),
@@ -43,6 +48,14 @@ class RTNQuantizer(KVQuantizer):
 
     def _dequantize_tensor(self, state: Dict[str, Any]) -> torch.Tensor:
         q = state["q"]
+        if state.get("packed", False):
+            q = unpack_bits(
+                q,
+                int(state["bits"]),
+                state["q_shape"],
+                int(state["q_numel"]),
+                signed=bool(state.get("signed", True)),
+            )
         scale = state["scale"]
         pad_len = state["pad_len"]
         orig_len = state["orig_shape"][1]
@@ -51,8 +64,8 @@ class RTNQuantizer(KVQuantizer):
         return _unshape_blocks(x, pad_len, orig_len)
 
     def quantize_kv(self, k, v, meta: Dict[str, Any] | None = None) -> Dict[str, Any]:
-        bf16_bytes = int(k.numel() * 2 + v.numel() * 2)
-        with timed() as t:
+        bf16_bytes = int(k.numel() * k.element_size() + v.numel() * v.element_size())
+        with timed(k.device) as t:
             k_state = self._quantize_tensor(k, self.key_bits)
             v_state = self._quantize_tensor(v, self.value_bits)
             tensor_dtype = (meta or {}).get("tensor_dtype", k.dtype)
@@ -66,7 +79,7 @@ class RTNQuantizer(KVQuantizer):
         return state
 
     def dequantize_kv(self, state: Dict[str, Any], meta: Dict[str, Any] | None = None) -> Tuple[Any, Any]:
-        with timed() as t:
+        with timed(state["k"]["q"].device) as t:
             k = self._dequantize_tensor(state["k"])
             v = self._dequantize_tensor(state["v"])
         self.stats.dequantize_time_s += t[0]
@@ -77,7 +90,11 @@ class RTNQuantizer(KVQuantizer):
         def _bytes_for_tensor(s: Dict[str, Any]) -> int:
             q = s["q"]
             scale = s["scale"]
-            return packed_bytes(q.numel(), int(s.get("bits", self.bits))) + scale.numel() * 2
+            if s.get("packed", False):
+                q_bytes = q.numel() * q.element_size()
+            else:
+                q_bytes = packed_bytes(q.numel(), int(s.get("bits", self.bits)))
+            return q_bytes + scale.numel() * 2
 
         return _bytes_for_tensor(state["k"]) + _bytes_for_tensor(state["v"])
 

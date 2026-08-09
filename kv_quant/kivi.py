@@ -5,6 +5,7 @@ from typing import Any, Dict, Tuple
 import torch
 
 from .base import KVQuantizer
+from .bitpack import pack_bits, unpack_bits
 from .packing import packed_bytes
 from .utils import _reshape_blocks, _unshape_blocks, dequantize_asym, quantize_asym, timed
 
@@ -40,7 +41,11 @@ class KIVIQuantizer(KVQuantizer):
         # per-channel over block tokens
         q, scale, zp = quantize_asym(xb, bits=self.key_bits, reduce_dims=(2,))
         return {
-            "q": q,
+            "q": pack_bits(q, self.key_bits, signed=False),
+            "q_shape": tuple(q.shape),
+            "q_numel": int(q.numel()),
+            "packed": True,
+            "signed": False,
             "scale": scale,
             "zp": zp,
             "pad_len": pad_len,
@@ -54,7 +59,11 @@ class KIVIQuantizer(KVQuantizer):
         # per-token (single scale/zero-point per token over head and channel)
         q, scale, zp = quantize_asym(xb, bits=self.value_bits, reduce_dims=(3, 4))
         return {
-            "q": q,
+            "q": pack_bits(q, self.value_bits, signed=False),
+            "q_shape": tuple(q.shape),
+            "q_numel": int(q.numel()),
+            "packed": True,
+            "signed": False,
             "scale": scale,
             "zp": zp,
             "pad_len": pad_len,
@@ -65,12 +74,21 @@ class KIVIQuantizer(KVQuantizer):
 
     def _dequantize(self, state: Dict[str, Any]) -> torch.Tensor:
         dtype = state.get("tensor_dtype", torch.bfloat16)
-        x = dequantize_asym(state["q"], state["scale"], state["zp"], dtype=dtype)
+        q = state["q"]
+        if state.get("packed", False):
+            q = unpack_bits(
+                q,
+                int(state["bits"]),
+                state["q_shape"],
+                int(state["q_numel"]),
+                signed=bool(state.get("signed", False)),
+            )
+        x = dequantize_asym(q, state["scale"], state["zp"], dtype=dtype)
         return _unshape_blocks(x, state["pad_len"], state["orig_shape"][1])
 
     def quantize_kv(self, k, v, meta: Dict[str, Any] | None = None) -> Dict[str, Any]:
-        bf16_bytes = int(k.numel() * 2 + v.numel() * 2)
-        with timed() as t:
+        bf16_bytes = int(k.numel() * k.element_size() + v.numel() * v.element_size())
+        with timed(k.device) as t:
             k_state = self._quantize_keys(k)
             v_state = self._quantize_values(v)
             tensor_dtype = (meta or {}).get("tensor_dtype", k.dtype)
@@ -84,7 +102,7 @@ class KIVIQuantizer(KVQuantizer):
         return state
 
     def dequantize_kv(self, state: Dict[str, Any], meta: Dict[str, Any] | None = None) -> Tuple[Any, Any]:
-        with timed() as t:
+        with timed(state["k"]["q"].device) as t:
             k = self._dequantize(state["k"])
             v = self._dequantize(state["v"])
         self.stats.dequantize_time_s += t[0]
@@ -96,7 +114,11 @@ class KIVIQuantizer(KVQuantizer):
             q = s["q"]
             scale = s["scale"]
             zp = s["zp"]
-            return packed_bytes(q.numel(), int(s.get("bits", self.bits))) + scale.numel() * 2 + zp.numel() * 2
+            if s.get("packed", False):
+                q_bytes = q.numel() * q.element_size()
+            else:
+                q_bytes = packed_bytes(q.numel(), int(s.get("bits", self.bits)))
+            return q_bytes + scale.numel() * 2 + zp.numel() * 2
 
         return _bytes_for_tensor(state["k"]) + _bytes_for_tensor(state["v"])
 

@@ -594,7 +594,6 @@ class LongCatVideoTransformer3DModel(ModelMixin, ConfigMixin):
             self.kv_quant_events.append(
                 {"bf16_bytes": bf16_bytes, "compressed_bytes": bf16_bytes}
             )
-            self._print_memory_usage(kv_cache_dict)
             cprint("No quantization is applied. Returning original KV cache.", "light_blue")
 
             return kv_cache_dict
@@ -643,12 +642,14 @@ class LongCatVideoTransformer3DModel(ModelMixin, ConfigMixin):
 
     def _quantize_kv_cache_shared(self, kv_cache_dict, offload_kv_cache=False):
         """Quantize each LongCat condition-cache layer through the shared API."""
-        output = {}
         bf16_bytes = 0
         compressed_bytes = 0
 
         with torch.no_grad():
-            for layer_idx, (k, v) in kv_cache_dict.items():
+            # Replace entries in the original dictionary so pipeline-owned
+            # references cannot keep a second full-precision cache alive.
+            for layer_idx in tuple(kv_cache_dict):
+                k, v = kv_cache_dict[layer_idx]
                 k, v = k.contiguous(), v.contiguous()
                 if offload_kv_cache:
                     k, v = _onload_kv_cache((k, v), "cuda")
@@ -658,9 +659,10 @@ class LongCatVideoTransformer3DModel(ModelMixin, ConfigMixin):
                 compressed_bytes += int(
                     self.kv_quantizer.memory_bytes(payload["state"])
                 )
-                output[layer_idx] = (
+                kv_cache_dict[layer_idx] = (
                     move_state_to(payload, "cpu") if offload_kv_cache else payload
                 )
+                del k, v, payload
 
         event = {
             "bf16_bytes": int(bf16_bytes),
@@ -674,7 +676,7 @@ class LongCatVideoTransformer3DModel(ModelMixin, ConfigMixin):
             f"compressed={compressed_bytes / 1024**2:.2f} MiB",
             "light_cyan",
         )
-        return output
+        return kv_cache_dict
 
 
     def _print_memory_usage(self, kv_cache_dict):
