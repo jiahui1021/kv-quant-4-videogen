@@ -29,6 +29,18 @@ from .blocks import (
 from quant_videogen.timer import time_logging_decorator
 from quant_videogen.compress import get_quantize_fn, compress_kv_cache
 from .utils import _onload_kv_cache, _offload_kv_cache
+try:
+    from kv_quant_adapter import (
+        encode_longcat_kv,
+        is_shared_quant_cache,
+        move_state_to,
+    )
+except ModuleNotFoundError:  # Also support importing LongCat as a namespace package.
+    from LongCat.kv_quant_adapter import (
+        encode_longcat_kv,
+        is_shared_quant_cache,
+        move_state_to,
+    )
 
 
 class LongCatSingleStreamBlock(nn.Module):
@@ -128,8 +140,10 @@ class LongCatSingleStreamBlock(nn.Module):
 
         with time_logging_decorator("Self Attention", logging_level=2):
             if kv_cache is not None:
-                # kv_cache = (kv_cache[0].to(x.device), kv_cache[1].to(x.device))
-                kv_cache = _onload_kv_cache(kv_cache, x.device)
+                if is_shared_quant_cache(kv_cache):
+                    kv_cache = move_state_to(kv_cache, x.device)
+                else:
+                    kv_cache = _onload_kv_cache(kv_cache, x.device)
                 attn_outputs = self.attn.forward_with_kv_cache(
                     x_m,
                     shape=latent_shape,
@@ -269,6 +283,21 @@ class LongCatVideoTransformer3DModel(ModelMixin, ConfigMixin):
         self.active_loras = []
 
         self.quant_config = None
+        self.kv_quantizer = None
+        self.kv_quant_method = "BF16"
+        self.kv_quant_events = []
+
+    def set_kv_quantizer(self, method_name, quantizer) -> None:
+        """Attach the shared KV quantizer to every self-attention block."""
+        self.kv_quant_method = str(method_name).upper()
+        self.kv_quantizer = quantizer
+        for block in self.blocks:
+            block.attn.kv_quantizer = quantizer
+
+    def reset_kv_quant_metrics(self) -> None:
+        self.kv_quant_events.clear()
+        if self.kv_quantizer is not None:
+            self.kv_quantizer.reset_stats()
 
     def load_lora(
         self,
@@ -486,12 +515,18 @@ class LongCatVideoTransformer3DModel(ModelMixin, ConfigMixin):
             if return_kv:
                 hidden_states, kv_cache = block_outputs
                 if offload_kv_cache:
-                    kv_cache_dict_ret[i] = (kv_cache[0].cpu(), kv_cache[1].cpu())
+                    if is_shared_quant_cache(kv_cache):
+                        kv_cache_dict_ret[i] = move_state_to(kv_cache, "cpu")
+                    else:
+                        kv_cache_dict_ret[i] = (kv_cache[0].cpu(), kv_cache[1].cpu())
                 else:
-                    kv_cache_dict_ret[i] = (
-                        kv_cache[0].contiguous(),
-                        kv_cache[1].contiguous(),
-                    )
+                    if is_shared_quant_cache(kv_cache):
+                        kv_cache_dict_ret[i] = kv_cache
+                    else:
+                        kv_cache_dict_ret[i] = (
+                            kv_cache[0].contiguous(),
+                            kv_cache[1].contiguous(),
+                        )
             else:
                 hidden_states = block_outputs
 
@@ -540,6 +575,12 @@ class LongCatVideoTransformer3DModel(ModelMixin, ConfigMixin):
 
     def quantize_kv_cache(self, kv_cache_dict, offload_kv_cache=False):
 
+        if self.kv_quantizer is not None:
+            return self._quantize_kv_cache_shared(
+                kv_cache_dict,
+                offload_kv_cache=offload_kv_cache,
+            )
+
         # Record the time using torch.cuda.Event
         start_time = torch.cuda.Event(enable_timing=True)
         end_time = torch.cuda.Event(enable_timing=True)
@@ -547,6 +588,12 @@ class LongCatVideoTransformer3DModel(ModelMixin, ConfigMixin):
 
         # Do nothing if quantization type is none
         if self.quant_config.quant_type == "none":
+            bf16_bytes = 0
+            for k, v in kv_cache_dict.values():
+                bf16_bytes += int((k.numel() + v.numel()) * k.element_size())
+            self.kv_quant_events.append(
+                {"bf16_bytes": bf16_bytes, "compressed_bytes": bf16_bytes}
+            )
             self._print_memory_usage(kv_cache_dict)
             cprint("No quantization is applied. Returning original KV cache.", "light_blue")
 
@@ -593,6 +640,41 @@ class LongCatVideoTransformer3DModel(ModelMixin, ConfigMixin):
         self._print_memory_usage(kv_cache_dict)
 
         return kv_cache_dict
+
+    def _quantize_kv_cache_shared(self, kv_cache_dict, offload_kv_cache=False):
+        """Quantize each LongCat condition-cache layer through the shared API."""
+        output = {}
+        bf16_bytes = 0
+        compressed_bytes = 0
+
+        with torch.no_grad():
+            for layer_idx, (k, v) in kv_cache_dict.items():
+                k, v = k.contiguous(), v.contiguous()
+                if offload_kv_cache:
+                    k, v = _onload_kv_cache((k, v), "cuda")
+
+                bf16_bytes += int((k.numel() + v.numel()) * k.element_size())
+                payload = encode_longcat_kv(k, v, self.kv_quantizer)
+                compressed_bytes += int(
+                    self.kv_quantizer.memory_bytes(payload["state"])
+                )
+                output[layer_idx] = (
+                    move_state_to(payload, "cpu") if offload_kv_cache else payload
+                )
+
+        event = {
+            "bf16_bytes": int(bf16_bytes),
+            "compressed_bytes": int(compressed_bytes),
+        }
+        self.kv_quant_events.append(event)
+        cprint(
+            "Shared KV quantization: "
+            f"{self.kv_quant_method}, "
+            f"BF16={bf16_bytes / 1024**2:.2f} MiB, "
+            f"compressed={compressed_bytes / 1024**2:.2f} MiB",
+            "light_cyan",
+        )
+        return output
 
 
     def _print_memory_usage(self, kv_cache_dict):

@@ -1,5 +1,8 @@
 import argparse
-import argparse
+import json
+import sys
+import time
+from pathlib import Path
 import torch
 import os
 from omegaconf import OmegaConf
@@ -10,7 +13,12 @@ from einops import rearrange
 import torch.distributed as dist
 from torch.utils.data import DataLoader, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
-import json
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+CAUSAL_ROOT = Path(__file__).resolve().parent
+for _path in (REPO_ROOT, CAUSAL_ROOT):
+    if str(_path) not in sys.path:
+        sys.path.insert(0, str(_path))
 
 from pipeline import (
     CausalDiffusionInferencePipeline,
@@ -20,6 +28,12 @@ from utils.dataset import TextDataset, TextImagePairDataset
 from utils.misc import set_seed
 
 from demo_utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller
+from kv_quant.factory import SUPPORTED_METHODS, parse_method
+from kv_quant_runtime import (
+    active_kv_memory_bytes,
+    attach_quantizer_to_pipeline,
+    reset_quantized_kv_cache,
+)
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--config_path", type=str, help="Path to the config file")
@@ -32,6 +46,19 @@ parser.add_argument("--seed", type=int, default=0, help="Random seed")
 parser.add_argument("--i2v", action="store_true", help="Whether to perform I2V (or T2V by default)")
 parser.add_argument("--report_timing", action="store_true",
                     help="Only tested on A800, for the Causal Forcing++ latency. Not make claims for other hardware like H100. For the result on H100, refer to the reported results in the Self Forcing paper.")
+parser.add_argument(
+    "--method",
+    type=str,
+    default="BF16",
+    choices=list(SUPPORTED_METHODS),
+    help="Shared causal self-attention KV-cache method",
+)
+parser.add_argument(
+    "--block_size",
+    type=int,
+    default=16,
+    help="Sequence block size for shared RTN/KIVI/QuaRot KV quantization",
+)
 args = parser.parse_args()
 
 # Initialize distributed inference
@@ -55,7 +82,7 @@ low_memory = get_cuda_free_memory_gb(gpu) < 40
 torch.set_grad_enabled(False)
 
 config = OmegaConf.load(args.config_path)
-default_config = OmegaConf.load("configs/default_config.yaml")
+default_config = OmegaConf.load(str(CAUSAL_ROOT / "configs/default_config.yaml"))
 config = OmegaConf.merge(default_config, config)
 
 # Initialize pipeline
@@ -88,6 +115,16 @@ else:
     pipeline.text_encoder.to(device=gpu)
 pipeline.generator.to(device=gpu)
 pipeline.vae.to(device=gpu)
+
+method_name, quantizer = parse_method(args.method, block_size=args.block_size)
+if quantizer is not None:
+    attach_quantizer_to_pipeline(
+        pipeline,
+        quantizer,
+        num_output_frames=args.num_output_frames,
+        dtype=torch.bfloat16,
+        device=device,
+    )
 
 
 # Create dataset
@@ -133,6 +170,68 @@ def encode(self, videos: torch.Tensor) -> torch.Tensor:
 
     output = torch.stack(output, dim=0)
     return output
+
+
+def _distributed_max_memory(device: torch.device) -> int:
+    value = torch.tensor(
+        [torch.cuda.max_memory_allocated(device)], device=device, dtype=torch.long
+    )
+    if dist.is_initialized():
+        dist.all_reduce(value, op=dist.ReduceOp.MAX)
+    return int(value.item())
+
+
+def _write_metrics(
+    prompt_idx: int,
+    method_name: str,
+    quantizer,
+    pipeline,
+    device: torch.device,
+    start_time: float,
+    output_folder: str,
+    block_size: int,
+) -> None:
+    torch.cuda.synchronize(device)
+    elapsed = time.perf_counter() - start_time
+    peak_vram_bytes = _distributed_max_memory(device)
+    bf16_kv_bytes, compressed_kv_bytes = (
+        active_kv_memory_bytes(pipeline, quantizer)
+        if quantizer is not None
+        else (0, 0)
+    )
+    stats = getattr(quantizer, "stats", None)
+    report = {
+        "model": "causal_forcing",
+        "method": method_name,
+        "block_size": int(block_size),
+        "bits": None if method_name == "BF16" else int(quantizer.bits),
+        "end_to_end_generation_time_s": float(elapsed),
+        "wall_clock_runtime_s": float(elapsed),
+        "peak_vram_bytes": peak_vram_bytes,
+        "peak_vram_gb": peak_vram_bytes / 1024**3,
+        "active_bf16_kv_bytes": int(bf16_kv_bytes),
+        "active_compressed_kv_bytes": int(compressed_kv_bytes),
+        "compression_ratio": (
+            bf16_kv_bytes / compressed_kv_bytes if compressed_kv_bytes else 0.0
+        ),
+        "quantize_time_s": 0.0 if stats is None else float(stats.quantize_time_s),
+        "dequantize_time_s": 0.0 if stats is None else float(stats.dequantize_time_s),
+        "quantize_calls": 0 if stats is None else int(stats.quantize_calls),
+        "dequantize_calls": 0 if stats is None else int(stats.dequantize_calls),
+        "prompt_idx": int(prompt_idx),
+    }
+    if quantizer is not None:
+        if stats.quantize_calls <= 0:
+            raise RuntimeError("KV quantization was never triggered.")
+        if stats.dequantize_calls <= 0:
+            raise RuntimeError("KV dequantization was never triggered.")
+
+    metrics_dir = Path(output_folder)
+    metrics_dir.mkdir(parents=True, exist_ok=True)
+    metrics_path = metrics_dir / f"metrics_{method_name}_{prompt_idx}.json"
+    metrics_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    if local_rank == 0:
+        print(f"Metrics written to {metrics_path}")
 
 
 for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
@@ -182,6 +281,12 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
             [1, args.num_output_frames, 16, 60, 104], device=device, dtype=torch.bfloat16
         )
 
+    if quantizer is not None:
+        reset_quantized_kv_cache(pipeline)
+        quantizer.reset_stats()
+    torch.cuda.reset_peak_memory_stats(device)
+    generation_start_time = time.perf_counter()
+
     sample_report_timing = args.report_timing and i >= 1
     video, latents = pipeline.inference(
         noise=sampled_noise,
@@ -214,5 +319,15 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
 
     output_path = os.path.join(args.output_folder, f'{prompt[:100]}.mp4')
     write_video(output_path, video[0], fps=16)
+    _write_metrics(
+        prompt_idx=idx,
+        method_name=method_name,
+        quantizer=quantizer,
+        pipeline=pipeline,
+        device=device,
+        start_time=generation_start_time,
+        output_folder=args.output_folder,
+        block_size=args.block_size,
+    )
 
        

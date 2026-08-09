@@ -13,6 +13,10 @@ from ..context_parallel.ulysses_wrapper import ulysses_wrapper
 
 from quant_videogen.timer import time_logging_decorator
 from quant_videogen.uncompress import uncompress_kv_cache
+try:
+    from kv_quant_adapter import decode_longcat_kv, is_shared_quant_cache
+except ModuleNotFoundError:  # Also support importing LongCat as a namespace package.
+    from LongCat.kv_quant_adapter import decode_longcat_kv, is_shared_quant_cache
 
 
 class Attention(nn.Module):
@@ -48,6 +52,7 @@ class Attention(nn.Module):
         self.proj = nn.Linear(dim, dim)
 
         self.rope_3d = RotaryPositionalEmbedding(self.head_dim, cp_split_hw=cp_split_hw)
+        self.kv_quantizer = None
 
 
     @ulysses_wrapper
@@ -265,10 +270,15 @@ class Attention(nn.Module):
 
         with time_logging_decorator("Rope 3D", logging_level=3):
             T, H, W = shape
-            k_cache, v_cache = kv_cache
-
-            # Uncompress the kv cache
-            k_cache, v_cache = uncompress_kv_cache(k_cache, v_cache)
+            if is_shared_quant_cache(kv_cache):
+                if self.kv_quantizer is None:
+                    raise RuntimeError(
+                        "Quantized LongCat cache exists but kv_quantizer is not attached"
+                    )
+                k_cache, v_cache = decode_longcat_kv(kv_cache, self.kv_quantizer)
+            else:
+                k_cache, v_cache = kv_cache
+                k_cache, v_cache = uncompress_kv_cache(k_cache, v_cache)
 
             assert k_cache.shape[0] == v_cache.shape[0] and k_cache.shape[0] in [1, B]
             if k_cache.shape[0] == 1:

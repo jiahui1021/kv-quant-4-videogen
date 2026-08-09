@@ -202,10 +202,36 @@ class CausalWanSelfAttention(nn.Module):
             roped_key = causal_rope_apply(
                 k, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
 
+            quantizer = kv_cache.get("quantizer")
+            if quantizer is not None:
+                kv_cache_size = kv_cache.get("kv_cache_size")
+                if kv_cache_size is None:
+                    cached_k = kv_cache.get("k")
+                    kv_cache_size = (
+                        int(cached_k.shape[1])
+                        if isinstance(cached_k, torch.Tensor) and cached_k.ndim == 4
+                        else int(self.max_attention_size)
+                    )
+                if kv_cache.get("quant_state") is not None:
+                    cache_k, cache_v = quantizer.dequantize_kv(
+                        kv_cache["quant_state"],
+                        meta={"tensor_dtype": v.dtype},
+                    )
+                    cache_k = cache_k.to(device=v.device, dtype=v.dtype)
+                    cache_v = cache_v.to(device=v.device, dtype=v.dtype)
+                else:
+                    cache_k = torch.zeros(
+                        [b, kv_cache_size, n, d], dtype=v.dtype, device=v.device
+                    )
+                    cache_v = torch.zeros_like(cache_k)
+            else:
+                cache_k = kv_cache["k"]
+                cache_v = kv_cache["v"]
+
             current_end = current_start + roped_query.shape[1]
             sink_tokens = self.sink_size * frame_seqlen
             # If we are using local attention and the current KV cache size is larger than the local attention size, we need to truncate the KV cache
-            kv_cache_size = kv_cache["k"].shape[1]
+            kv_cache_size = cache_k.shape[1]
             num_new_tokens = roped_query.shape[1]
             if self.local_attn_size != -1 and (current_end > kv_cache["global_end_index"].item()) and (
                     num_new_tokens + kv_cache["local_end_index"].item() > kv_cache_size):
@@ -214,29 +240,42 @@ class CausalWanSelfAttention(nn.Module):
                 # Clone the source slice to avoid overlapping memory error
                 num_evicted_tokens = num_new_tokens + kv_cache["local_end_index"].item() - kv_cache_size
                 num_rolled_tokens = kv_cache["local_end_index"].item() - num_evicted_tokens - sink_tokens
-                kv_cache["k"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
-                    kv_cache["k"][:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
-                kv_cache["v"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
-                    kv_cache["v"][:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
+                cache_k[:, sink_tokens:sink_tokens + num_rolled_tokens] = \
+                    cache_k[:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
+                cache_v[:, sink_tokens:sink_tokens + num_rolled_tokens] = \
+                    cache_v[:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
                 # Insert the new keys/values at the end
                 local_end_index = kv_cache["local_end_index"].item() + current_end - \
                     kv_cache["global_end_index"].item() - num_evicted_tokens
                 local_start_index = local_end_index - num_new_tokens
-                kv_cache["k"][:, local_start_index:local_end_index] = roped_key
-                kv_cache["v"][:, local_start_index:local_end_index] = v
+                cache_k[:, local_start_index:local_end_index] = roped_key
+                cache_v[:, local_start_index:local_end_index] = v
             else:
                 # Assign new keys/values directly up to current_end
                 local_end_index = kv_cache["local_end_index"].item() + current_end - kv_cache["global_end_index"].item()
                 local_start_index = local_end_index - num_new_tokens
-                kv_cache["k"][:, local_start_index:local_end_index] = roped_key
-                kv_cache["v"][:, local_start_index:local_end_index] = v
+                cache_k[:, local_start_index:local_end_index] = roped_key
+                cache_v[:, local_start_index:local_end_index] = v
             x = attention(
                 roped_query,
-                kv_cache["k"][:, max(0, local_end_index - self.max_attention_size):local_end_index],
-                kv_cache["v"][:, max(0, local_end_index - self.max_attention_size):local_end_index]
+                cache_k[:, max(0, local_end_index - self.max_attention_size):local_end_index],
+                cache_v[:, max(0, local_end_index - self.max_attention_size):local_end_index]
             )
             kv_cache["global_end_index"].fill_(current_end)
             kv_cache["local_end_index"].fill_(local_end_index)
+            if quantizer is not None:
+                kv_cache["kv_cache_size"] = int(cache_k.shape[1])
+                kv_cache["batch_size"] = int(cache_k.shape[0])
+                kv_cache["num_heads"] = int(cache_k.shape[2])
+                kv_cache["head_dim"] = int(cache_k.shape[3])
+                kv_cache["quant_state"] = quantizer.quantize_kv(
+                    cache_k,
+                    cache_v,
+                    meta={"tensor_dtype": v.dtype},
+                )
+                # Quantized methods keep only the compressed persistent state.
+                kv_cache["k"] = cache_k.new_empty(0)
+                kv_cache["v"] = cache_v.new_empty(0)
 
         # output
         x = x.flatten(2)

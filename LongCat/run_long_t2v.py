@@ -2,11 +2,21 @@ import os
 import random
 import argparse
 import datetime
+import json
+import sys
+import time
+from pathlib import Path
 import PIL.Image
 import numpy as np
 
 import torch
 import torch.distributed as dist
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+LONGCAT_ROOT = Path(__file__).resolve().parent
+for _path in (REPO_ROOT, LONGCAT_ROOT):
+    if str(_path) not in sys.path:
+        sys.path.insert(0, str(_path))
 
 from transformers import AutoTokenizer, UMT5EncoderModel
 from torchvision.io import write_video, read_video
@@ -27,6 +37,7 @@ from quant_videogen.timer import print_operator_log_data
 from quant_videogen.misc import Color
 from quant_videogen.logger import logger
 from quant_videogen.sim.quant.quantize_config import QuantizeConfig
+from kv_quant.factory import SUPPORTED_METHODS, parse_method
 
 
 def torch_gc():
@@ -72,6 +83,77 @@ def init_cp(context_parallel_size, global_rank, num_processes):
     cp_split_hw = context_parallel_util.get_optimal_split(cp_size)
 
     return cp_split_hw
+
+
+def _distributed_max_int(value: int, device: torch.device) -> int:
+    tensor = torch.tensor([int(value)], device=device, dtype=torch.long)
+    if dist.is_initialized():
+        dist.all_reduce(tensor, op=dist.ReduceOp.MAX)
+    return int(tensor.item())
+
+
+def _write_generation_metrics(args, dit, device, start_time: float, prompt_idx: int, seed: int):
+    """Write one machine-readable report for the completed video generation."""
+    if torch.cuda.is_available():
+        torch.cuda.synchronize(device)
+    wall_clock_runtime_s = time.perf_counter() - start_time
+    peak_vram_bytes = _distributed_max_int(
+        torch.cuda.max_memory_allocated(device), device
+    )
+
+    events = list(getattr(dit, "kv_quant_events", []))
+    peak_bf16_kv_bytes = max(
+        (int(event.get("bf16_bytes", 0)) for event in events),
+        default=0,
+    )
+    peak_compressed_kv_bytes = max(
+        (int(event.get("compressed_bytes", 0)) for event in events),
+        default=0,
+    )
+    quantizer = getattr(dit, "kv_quantizer", None)
+    stats = getattr(quantizer, "stats", None)
+    method = getattr(dit, "kv_quant_method", "BF16")
+    if method == "BF16" and peak_bf16_kv_bytes:
+        peak_compressed_kv_bytes = peak_bf16_kv_bytes
+
+    report = {
+        "model": "longcat",
+        "method": method,
+        "block_size": int(args.block_size),
+        "bits": None if method == "BF16" else int(method.rsplit("INT", 1)[1]),
+        "end_to_end_generation_time_s": float(wall_clock_runtime_s),
+        "wall_clock_runtime_s": float(wall_clock_runtime_s),
+        "peak_vram_bytes": peak_vram_bytes,
+        "peak_vram_gb": peak_vram_bytes / 1024**3,
+        "peak_bf16_kv_bytes": peak_bf16_kv_bytes,
+        "peak_compressed_kv_bytes": peak_compressed_kv_bytes,
+        "compression_ratio": (
+            peak_bf16_kv_bytes / peak_compressed_kv_bytes
+            if peak_compressed_kv_bytes
+            else 0.0
+        ),
+        "quantize_time_s": 0.0 if stats is None else float(stats.quantize_time_s),
+        "dequantize_time_s": 0.0 if stats is None else float(stats.dequantize_time_s),
+        "quantize_calls": 0 if stats is None else int(stats.quantize_calls),
+        "dequantize_calls": 0 if stats is None else int(stats.dequantize_calls),
+        "num_kv_segments": len(events),
+        "prompt_idx": int(prompt_idx),
+        "seed": int(seed),
+    }
+
+    if quantizer is not None and stats.quantize_calls <= 0:
+        raise RuntimeError("KV quantization was never triggered.")
+    if quantizer is not None and stats.dequantize_calls <= 0:
+        raise RuntimeError("KV dequantization was never triggered.")
+
+    metrics_dir = Path(args.output_dir) / f"{prompt_idx}-{seed}"
+    metrics_dir.mkdir(parents=True, exist_ok=True)
+    metrics_path = metrics_dir / f"metrics_{method}.json"
+    if dist.is_initialized():
+        dist.barrier()
+    if int(os.environ.get("RANK", "0")) == 0:
+        metrics_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        print(f"Metrics written to {metrics_path}")
 
 
 def get_model_and_pipe(
@@ -162,6 +244,16 @@ def generate(args):
         cp_split_hw,
         enable_compile,
     )
+    method_name, quantizer = parse_method(args.method, block_size=args.block_size)
+    if method_name != "BF16" and args.quant_type != "none":
+        raise ValueError(
+            "Do not enable shared RTN/KIVI/QuaRot and legacy --quant_type at the same time."
+        )
+    dit.set_kv_quantizer(method_name, quantizer)
+    dit.reset_kv_quant_metrics()
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats(local_rank)
+    generation_start_time = time.perf_counter()
     logger.info(f"{Color.green}Prompt: {prompt}{Color.reset}")
 
     logger.info(
@@ -592,6 +684,15 @@ def generate(args):
                     options={"crf": f"{10}"},
                 )
 
+    _write_generation_metrics(
+        args,
+        dit,
+        torch.device(f"cuda:{local_rank}"),
+        generation_start_time,
+        prompt_idx,
+        seed,
+    )
+
 
 def _parse_args():
     parser = argparse.ArgumentParser()
@@ -707,7 +808,7 @@ def _parse_args():
     workload_group.add_argument(
         "--workload",
         type=str,
-        default="init",
+        default="480p_init",
         choices=[
             "480p_init",
             "480p_long_gen",
@@ -745,6 +846,19 @@ def _parse_args():
     # Quantization Arguments
     quant_group = parser.add_argument_group(
         "Quantization", "Arguments for model quantization"
+    )
+    quant_group.add_argument(
+        "--method",
+        type=str,
+        default="BF16",
+        choices=list(SUPPORTED_METHODS),
+        help="Shared KV-cache method used by LongCat generation",
+    )
+    quant_group.add_argument(
+        "--block_size",
+        type=int,
+        default=16,
+        help="Sequence block size for shared RTN/KIVI/QuaRot KV quantization",
     )
     quant_group.add_argument(
         "--quant_type",

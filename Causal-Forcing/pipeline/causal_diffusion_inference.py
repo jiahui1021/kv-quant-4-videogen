@@ -125,6 +125,10 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                     [0], dtype=torch.long, device=noise.device)
                 self.kv_cache_neg[block_index]["local_end_index"] = torch.tensor(
                     [0], dtype=torch.long, device=noise.device)
+                if "quantizer" in self.kv_cache_pos[block_index]:
+                    self.kv_cache_pos[block_index]["quant_state"] = None
+                if "quantizer" in self.kv_cache_neg[block_index]:
+                    self.kv_cache_neg[block_index]["quant_state"] = None
 
         # Step 2: Cache context feature
         current_start_frame = start_frame_index
