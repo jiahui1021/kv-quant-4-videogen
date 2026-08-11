@@ -24,6 +24,9 @@ def create_quantizer(method: str, bits: int | None, block_size: int, **kwargs):
             key_bits=kwargs.get("key_bits"),
             value_bits=kwargs.get("value_bits"),
             name=kwargs.get("name"),
+            residual_length=kwargs.get("residual_length"),
+            value_group_size=kwargs.get("value_group_size"),
+            channel_group_size=kwargs.get("channel_group_size"),
         )
     if method == "KIVI":
         from .shared import create_shared_quantizer
@@ -34,6 +37,9 @@ def create_quantizer(method: str, bits: int | None, block_size: int, **kwargs):
             key_bits=kwargs.get("key_bits"),
             value_bits=kwargs.get("value_bits"),
             name=kwargs.get("name"),
+            residual_length=kwargs.get("residual_length"),
+            value_group_size=kwargs.get("value_group_size"),
+            channel_group_size=kwargs.get("channel_group_size"),
         )
     if method == "QUAROT_KV":
         from .shared import create_shared_quantizer
@@ -44,6 +50,9 @@ def create_quantizer(method: str, bits: int | None, block_size: int, **kwargs):
             key_bits=kwargs.get("key_bits"),
             value_bits=kwargs.get("value_bits"),
             name=kwargs.get("name"),
+            residual_length=kwargs.get("residual_length"),
+            value_group_size=kwargs.get("value_group_size"),
+            channel_group_size=kwargs.get("channel_group_size"),
         )
     if method == "PRQ":
         from .prq import PRQQuantizer

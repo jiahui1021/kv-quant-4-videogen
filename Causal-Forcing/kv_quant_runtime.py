@@ -100,10 +100,31 @@ def reset_quantized_kv_cache(pipeline) -> None:
             block["global_end_index"].fill_(0)
             block["local_end_index"].fill_(0)
             block["quant_state"] = None
+            block.pop("eviction_slack_tokens", None)
+            for key in ("recent_k", "recent_v"):
+                value = block.get(key)
+                if isinstance(value, torch.Tensor) and value.ndim == 4:
+                    block[key] = value[:, :0].clone()
+            block["recent_start_index"] = 0
+            block["recent_end_index"] = 0
             if isinstance(block.get("k"), torch.Tensor) and block["k"].numel():
                 block["k"].zero_()
             if isinstance(block.get("v"), torch.Tensor) and block["v"].numel():
                 block["v"].zero_()
+
+
+def finalize_quantized_kv_cache(pipeline, quantizer=None) -> None:
+    """Commit the final mutable write buffer after generation finishes."""
+    if quantizer is None or not callable(getattr(quantizer, "finalize_state", None)):
+        return
+    for cache_list in _cache_lists(pipeline):
+        for block in cache_list:
+            state = block.get("quant_state")
+            if state is None:
+                continue
+            write_k = state.get("write_k") if isinstance(state, dict) else None
+            dtype = write_k.dtype if isinstance(write_k, torch.Tensor) else block.get("dtype", torch.bfloat16)
+            quantizer.finalize_state(state, meta={"tensor_dtype": dtype})
 
 
 def resident_kv_memory_bytes(pipeline, quantizer=None) -> tuple[int, int]:
@@ -131,8 +152,9 @@ def resident_kv_memory_bytes(pipeline, quantizer=None) -> tuple[int, int]:
             block_bf16_bytes = batch_size * capacity_tokens * num_heads * head_dim * element_size * 2
             bf16_bytes += block_bf16_bytes
             state = block.get("quant_state")
-            if state is not None and quantizer is not None:
-                compressed_bytes += int(quantizer.memory_bytes(state))
+            if quantizer is not None:
+                if state is not None:
+                    compressed_bytes += int(quantizer.memory_bytes(state))
             else:
                 compressed_bytes += block_bf16_bytes
     return int(bf16_bytes), int(compressed_bytes)

@@ -31,6 +31,7 @@ from demo_utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller
 from kv_quant.factory import SUPPORTED_METHODS, parse_method
 from kv_quant_runtime import (
     attach_quantizer_to_pipeline,
+    finalize_quantized_kv_cache,
     reset_quantized_kv_cache,
     resident_kv_memory_bytes,
 )
@@ -198,6 +199,7 @@ def _write_metrics(
     block_size: int,
 ) -> None:
     torch.cuda.synchronize(device)
+    finalize_quantized_kv_cache(pipeline, quantizer)
     elapsed = time.perf_counter() - start_time
     peak_vram_bytes = _distributed_max_memory(device)
     bf16_kv_bytes, compressed_kv_bytes = resident_kv_memory_bytes(
@@ -221,6 +223,11 @@ def _write_metrics(
         # use resident-capacity accounting as well.
         "active_bf16_kv_bytes": int(bf16_kv_bytes),
         "active_compressed_kv_bytes": int(compressed_kv_bytes),
+        "effective_kv_bits_per_value": (
+            compressed_kv_bytes * 8 / max(bf16_kv_bytes / 2, 1)
+            if compressed_kv_bytes
+            else 16.0
+        ),
         "compression_ratio": (
             bf16_kv_bytes / compressed_kv_bytes if compressed_kv_bytes else 0.0
         ),

@@ -53,9 +53,11 @@ def create_shared_quantizer(
     **kwargs: Any,
 ):
     """Create RTN/KIVI/QuaRot from the repository-level implementation."""
-    if kwargs:
-        unsupported = ", ".join(sorted(kwargs))
-        raise TypeError(f"Unsupported shared quantizer arguments: {unsupported}")
+    supported = {"residual_length", "value_group_size", "channel_group_size"}
+    unsupported = set(kwargs) - supported
+    if unsupported:
+        names = ", ".join(sorted(unsupported))
+        raise TypeError(f"Unsupported shared quantizer arguments: {names}")
     factory = _shared_factory()
     return factory.create_quantizer(
         method,
@@ -64,4 +66,7 @@ def create_shared_quantizer(
         key_bits=key_bits,
         value_bits=value_bits,
         name=name,
+        residual_length=kwargs.get("residual_length"),
+        value_group_size=kwargs.get("value_group_size"),
+        channel_group_size=kwargs.get("channel_group_size"),
     )

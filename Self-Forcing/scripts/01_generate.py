@@ -68,6 +68,7 @@ def parse_method(
     spatial_min_foreground_ratio: float,
     spatial_max_foreground_ratio: float,
     spatial_target_foreground_ratio: float,
+    kivi_residual_length: Optional[int] = None,
 ):
     method = method.upper()
     flowcache_layer_budget_table = load_layer_budget_table(flowcache_layer_budget_path)
@@ -125,7 +126,12 @@ def parse_method(
 
     if bits is not None:
         if method in ("RTN", "KIVI", "QUAROT_KV"):
-            return f"{method}_INT{bits}", create_quantizer(method, bits=bits, block_size=block_size)
+            return f"{method}_INT{bits}", create_quantizer(
+                method,
+                bits=bits,
+                block_size=block_size,
+                residual_length=kivi_residual_length if method == "KIVI" else None,
+            )
         if method == "PRQ":
             return f"{method}_INT{bits}", create_quantizer(
                 method, bits=bits, block_size=block_size, residual_bits=prq_residual_bits
@@ -331,7 +337,12 @@ def parse_method(
             refresh_gap_chunks=flowcache_prune_refresh_gap_chunks,
         )
         return quantizer.name(), quantizer
-    return method, create_quantizer(base, bits=parsed_bits, block_size=block_size)
+    return method, create_quantizer(
+        base,
+        bits=parsed_bits,
+        block_size=block_size,
+        residual_length=kivi_residual_length if base == "KIVI" else None,
+    )
 
 
 def load_layer_budget_table(path_str: Optional[str]) -> Dict[int, float] | None:
@@ -393,6 +404,19 @@ def reset_kv_state(pipeline, quantizer):
             block["recent_start_index"] = 0
             block["recent_end_index"] = 0
             block["quantize_on_write"] = block.get("quantize_cadence", "per_step") == "per_step"
+
+
+def finalize_kv_state(pipeline, quantizer) -> None:
+    """Commit the final mutable write buffer for resident-byte reporting."""
+    if quantizer is None or not callable(getattr(quantizer, "finalize_state", None)):
+        return
+    for block in getattr(pipeline, "kv_cache1", None) or []:
+        state = block.get("quant_state")
+        if state is None:
+            continue
+        write_k = state.get("write_k") if isinstance(state, dict) else None
+        dtype = write_k.dtype if isinstance(write_k, torch.Tensor) else block.get("dtype", torch.bfloat16)
+        quantizer.finalize_state(state, meta={"tensor_dtype": dtype})
 
 
 def initialize_pipeline(
@@ -499,6 +523,16 @@ def _current_active_kv_bytes(pipeline, quantizer) -> tuple[int, int]:
         if quantizer is None:
             compressed_bytes += batch_size * active_tokens * num_heads * head_dim * 2 * 2
         else:
+            quant_state = block.get("quant_state")
+            if (
+                quant_state is not None
+                and callable(getattr(quantizer, "init_state", None))
+                and hasattr(quantizer, "memory_bytes")
+            ):
+                # The shared baselines account for packed segments, scales,
+                # and their BF16 residual/write buffers directly from state.
+                compressed_bytes += int(quantizer.memory_bytes(quant_state))
+                continue
             frame_seq_length = int(block.get("frame_seq_length", 0))
             num_frame_per_block = int(block.get("num_frame_per_block", 1))
             recent_blocks = int(block.get("recent_blocks", 0))
@@ -599,6 +633,7 @@ def run(args: argparse.Namespace) -> None:
         args.spatial_min_foreground_ratio,
         args.spatial_max_foreground_ratio,
         args.spatial_target_foreground_ratio,
+        args.kivi_residual_length,
     )
 
     if quantizer is not None and hasattr(quantizer, "set_timing_enabled"):
@@ -727,6 +762,7 @@ def run(args: argparse.Namespace) -> None:
                     return_latents=True,
                     low_memory=low_memory,
                 )
+            finalize_kv_state(pipeline, quantizer)
             runtime_s = time.perf_counter() - start
             if trace_thread is not None:
                 trace_stop_event.set()
@@ -842,6 +878,11 @@ def run(args: argparse.Namespace) -> None:
         "dequantize_calls": 0.0 if quantizer is None else int(quantizer.stats.dequantize_calls),
         "bf16_kv_bytes": bf16_kv_bytes,
         "compressed_kv_bytes": compressed_kv_bytes,
+        "effective_kv_bits_per_value": (
+            compressed_kv_bytes * 8 / max(bf16_kv_bytes / 2, 1)
+            if compressed_kv_bytes
+            else 16.0
+        ),
         "compression_ratio": (bf16_kv_bytes / compressed_kv_bytes) if compressed_kv_bytes > 0 else 0.0,
         "first_video_shape": list(first_video_shape) if first_video_shape is not None else None,
         "cache_policy": cache_policy,
@@ -872,6 +913,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--bits", type=int, default=None, help="Optional bit-width when using method names RTN/KIVI/QUAROT_KV/PRQ/QAQ/AGE_TIER/TPTQ/FLOWCACHE_HYBRID/FLOWCACHE_ADAPTIVE/FLOWCACHE_PRUNE/FLOWCACHE_SOFT_PRUNE"
     )
     parser.add_argument("--block-size", type=int, default=16)
+    parser.add_argument(
+        "--kivi-residual-length",
+        type=int,
+        default=None,
+        help="Recent BF16 token count kept by incremental KIVI; defaults to block size.",
+    )
     parser.add_argument("--prq-residual-bits", type=int, default=4, choices=[2, 4])
     parser.add_argument("--qaq-outlier-threshold", type=float, default=6.0)
     parser.add_argument("--age-tier-recent-ratio", type=float, default=0.3)

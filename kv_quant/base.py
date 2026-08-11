@@ -92,6 +92,42 @@ class KVQuantizer(ABC):
     def quantize_kv(self, k, v, meta: Dict[str, Any] | None = None) -> Dict[str, Any]:
         raise NotImplementedError
 
+    # The one-shot methods above remain part of the public adapter contract
+    # (LongCat uses them).  These runtime methods are implemented by the
+    # shared RTN/KIVI/QuaRot baselines and are intentionally separate so
+    # legacy experimental quantizers can keep their existing behavior.
+    def init_state(self, meta: Dict[str, Any] | None = None) -> Dict[str, Any]:
+        raise NotImplementedError
+
+    def append_kv(
+        self,
+        state: Dict[str, Any],
+        new_k,
+        new_v,
+        meta: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]:
+        raise NotImplementedError
+
+    def materialize_kv(
+        self,
+        state: Dict[str, Any],
+        meta: Dict[str, Any] | None = None,
+    ) -> Tuple[Any, Any]:
+        raise NotImplementedError
+
+    def finalize_state(
+        self,
+        state: Dict[str, Any],
+        meta: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]:
+        raise NotImplementedError
+
+    def evict_prefix(self, state: Dict[str, Any], requested_tokens: int) -> int:
+        raise NotImplementedError
+
+    def evict_range(self, state: Dict[str, Any], start_tokens: int, requested_tokens: int) -> int:
+        raise NotImplementedError
+
     @abstractmethod
     def dequantize_kv(self, state: Dict[str, Any], meta: Dict[str, Any] | None = None) -> Tuple[Any, Any]:
         raise NotImplementedError

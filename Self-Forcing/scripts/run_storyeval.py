@@ -31,7 +31,12 @@ from pipeline import CausalDiffusionInferencePipeline, CausalInferencePipeline
 from utils.misc import set_seed
 
 
-def parse_method(method: str, bits: int | None, block_size: int):
+def parse_method(
+    method: str,
+    bits: int | None,
+    block_size: int,
+    kivi_residual_length: int | None = None,
+):
     method = method.upper()
     cache_policy = {"cadence": "per_step", "recent_blocks": 0}
     if method == "BF16":
@@ -40,7 +45,13 @@ def parse_method(method: str, bits: int | None, block_size: int):
     if bits is not None:
         if method in ("RTN", "KIVI", "QUAROT_KV"):
             method_name = f"{method}_INT{bits}"
-            return method_name, create_quantizer(method, bits=bits, block_size=block_size, name=method_name), cache_policy
+            return method_name, create_quantizer(
+                method,
+                bits=bits,
+                block_size=block_size,
+                name=method_name,
+                residual_length=kivi_residual_length if method == "KIVI" else None,
+            ), cache_policy
         raise ValueError(f"Unsupported method={method} with explicit bits")
 
     m = __import__("re").fullmatch(r"(RTN|KIVI|QUAROT_KV)_INT(2|4)(?:_(REFRESH))?(?:_RECENT(\d+))?", method)
@@ -51,7 +62,13 @@ def parse_method(method: str, bits: int | None, block_size: int):
             cache_policy["cadence"] = "refresh_only"
         if m.group(4):
             cache_policy["recent_blocks"] = int(m.group(4))
-        return method, create_quantizer(base, bits=parsed_bits, block_size=block_size, name=method), cache_policy
+        return method, create_quantizer(
+            base,
+            bits=parsed_bits,
+            block_size=block_size,
+            name=method,
+            residual_length=kivi_residual_length if base == "KIVI" else None,
+        ), cache_policy
 
     m = __import__("re").fullmatch(r"(RTN|KIVI)_K(2|4)_V(2|4)(?:_(REFRESH))?(?:_RECENT(\d+))?", method)
     if m:
@@ -71,6 +88,7 @@ def parse_method(method: str, bits: int | None, block_size: int):
                 key_bits=key_bits,
                 value_bits=value_bits,
                 name=method,
+                residual_length=kivi_residual_length if base == "KIVI" else None,
             ),
             cache_policy,
         )
@@ -113,6 +131,19 @@ def reset_kv_state(pipeline, quantizer=None) -> None:
             block["recent_start_index"] = 0
             block["recent_end_index"] = 0
             block["quantize_on_write"] = block.get("quantize_cadence", "per_step") == "per_step"
+
+
+def finalize_kv_state(pipeline, quantizer) -> None:
+    """Commit the final mutable write buffer for resident-byte reporting."""
+    if quantizer is None or not callable(getattr(quantizer, "finalize_state", None)):
+        return
+    for block in getattr(pipeline, "kv_cache1", None) or []:
+        state = block.get("quant_state")
+        if state is None:
+            continue
+        write_k = state.get("write_k") if isinstance(state, dict) else None
+        dtype = write_k.dtype if isinstance(write_k, torch.Tensor) else block.get("dtype", torch.bfloat16)
+        quantizer.finalize_state(state, meta={"tensor_dtype": dtype})
 
 
 def initialize_pipeline(
@@ -196,6 +227,14 @@ def _current_active_kv_bytes(pipeline, quantizer=None) -> tuple[int, int]:
         if quantizer is None:
             compressed_bytes += batch_size * active_tokens * num_heads * head_dim * 2 * 2
         else:
+            quant_state = block.get("quant_state")
+            if (
+                quant_state is not None
+                and callable(getattr(quantizer, "init_state", None))
+                and hasattr(quantizer, "memory_bytes")
+            ):
+                compressed_bytes += int(quantizer.memory_bytes(quant_state))
+                continue
             frame_seq_length = int(block.get("frame_seq_length", 0))
             num_frame_per_block = int(block.get("num_frame_per_block", 1))
             recent_blocks = int(block.get("recent_blocks", 0))
@@ -318,7 +357,12 @@ def run(args: argparse.Namespace) -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for StoryEval generation.")
 
-    method_name, quantizer, cache_policy = parse_method(args.method, args.bits, args.block_size)
+    method_name, quantizer, cache_policy = parse_method(
+        args.method,
+        args.bits,
+        args.block_size,
+        args.kivi_residual_length,
+    )
     if quantizer is not None and hasattr(quantizer, "set_timing_enabled"):
         quantizer.set_timing_enabled(args.profile_quant_timing)
     out_root = args.out_root if args.out_root.is_absolute() else (REPO_ROOT / args.out_root)
@@ -488,6 +532,7 @@ def run(args: argparse.Namespace) -> None:
                             return_latents=True,
                             low_memory=low_memory,
                         )
+                    finalize_kv_state(pipeline, quantizer)
                     runtime_s = float(time.perf_counter() - start_t)
                     peak_bytes = int(torch.cuda.max_memory_allocated(device))
                     total_frames = int(video.shape[1])
@@ -598,6 +643,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--method", type=str, default="BF16", help="BF16, RTN_INT4, RTN_INT2, KIVI_INT4, KIVI_INT2, QUAROT_KV_INT4")
     parser.add_argument("--bits", type=int, default=None, help="Optional bit-width when using method names RTN/KIVI/QUAROT_KV")
     parser.add_argument("--block_size", type=int, default=16)
+    parser.add_argument(
+        "--kivi-residual-length",
+        type=int,
+        default=None,
+        help="Recent BF16 token count kept by incremental KIVI; defaults to block size.",
+    )
     parser.add_argument("--out_root", type=Path, default=Path("results/benchmarks/storyeval"))
     parser.add_argument("--run_id", type=str, default=f"storyeval_{int(time.time())}")
     parser.add_argument("--max_prompts", type=int, default=None)

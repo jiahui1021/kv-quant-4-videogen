@@ -21,6 +21,9 @@ def create_quantizer(
     key_bits: int | None = None,
     value_bits: int | None = None,
     name: str | None = None,
+    residual_length: int | None = None,
+    value_group_size: int | None = None,
+    channel_group_size: int | None = None,
 ):
     """Create one of the shared KV-cache quantizers."""
     method = method.upper()
@@ -43,6 +46,8 @@ def create_quantizer(
             key_bits=key_bits,
             value_bits=value_bits,
             name=name,
+            residual_length=residual_length,
+            value_group_size=value_group_size,
         )
     if method == "QUAROT_KV":
         from .quarot_kv import QuaRotKVQuantizer
@@ -53,6 +58,7 @@ def create_quantizer(
             key_bits=key_bits,
             value_bits=value_bits,
             name=name,
+            channel_group_size=channel_group_size,
         )
     raise ValueError(f"Unsupported KV quantization method: {method}")
 
