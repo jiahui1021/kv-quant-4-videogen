@@ -136,10 +136,18 @@ class QVGMemory:
     physical_compressed_bytes: int
     bf16_chunks: int
     quantized_chunks: int
+    logical_value_count: int
 
     @property
     def logical_values(self) -> int:
-        return self.bf16_equivalent_bytes // 2
+        """Number of resident logical K/V values represented by the cache.
+
+        Keep this count independent from the storage dtype.  QVG currently
+        attaches BF16 caches, but deriving the denominator from
+        ``bf16_equivalent_bytes / 2`` would silently become wrong if a cache
+        were ever created with another dtype.
+        """
+        return self.logical_value_count
 
 
 def _load_qvg():
@@ -594,6 +602,7 @@ def _iter_tensors(value: Any, seen: set[int]) -> Iterable[torch.Tensor]:
 def qvg_memory_breakdown(pipeline) -> QVGMemory:
     """Count physical tensors and their full-BF16 logical equivalent."""
     equivalent = 0
+    logical_values = 0
     physical_bf16 = 0
     physical_compressed = 0
     bf16_chunks = 0
@@ -613,12 +622,14 @@ def qvg_memory_breakdown(pipeline) -> QVGMemory:
                     state_value = int(state)
                     if state_value == 1:
                         equivalent += chunk_values * element_size
+                        logical_values += chunk_values
                         bf16_chunks += 1
                         if chunk is not None and id(chunk) not in seen:
                             seen.add(id(chunk))
                             physical_bf16 += chunk.numel() * chunk.element_size()
                     elif state_value == 2:
                         equivalent += chunk_values * element_size
+                        logical_values += chunk_values
                         quantized_chunks += 1
                 for span in cache.quantized_spans:
                     for tensor in _iter_tensors(span["quant_data"], seen):
@@ -635,6 +646,7 @@ def qvg_memory_breakdown(pipeline) -> QVGMemory:
         physical_compressed_bytes=int(physical_compressed),
         bf16_chunks=int(bf16_chunks),
         quantized_chunks=int(quantized_chunks),
+        logical_value_count=int(logical_values),
     )
 
 
