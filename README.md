@@ -140,11 +140,14 @@ python Causal-Forcing/inference.py \
   --checkpoint_path /path/to/causal_forcing.pt \
   --data_path Causal-Forcing/prompts/demos.txt \
   --output_folder results/causal_forcing/RTN_INT4 \
-  --num_output_frames 21 \
+  --num_output_frames 180 \
   --method RTN_INT4 \
   --block_size 16 \
   --use_ema
 ```
+
+`--num_output_frames` is in latent frames; 180 latent frames produce 717
+pixel frames (44.8s @ 16fps), matching the long-video causal_forcing results.
 
 For QVG, install the dependencies in `Causal-Forcing/requirements-qvg.txt`
 and run the launcher:
@@ -156,7 +159,8 @@ bash Causal-Forcing/run_qvg.sh
 ```
 
 The default is QVG_INT2; use `METHOD=QVG_INT4` for INT4. The launcher uses the
-chunkwise 51-frame configuration and currently supports T2V only.
+chunkwise 180-latent-frame configuration (717 pixel frames) and currently
+supports T2V only.
 
 For text-to-video, use a prompt file such as `Causal-Forcing/prompts/demos.txt`. For image-to-video, add `--i2v` and pass an image-prompt dataset supported by the original Causal-Forcing loader.
 
@@ -167,7 +171,7 @@ CONFIG_PATH=Causal-Forcing/configs/causal_forcing_dmd_framewise.yaml \
 CHECKPOINT_PATH=/path/to/causal_forcing.pt \
 DATA_PATH=Causal-Forcing/prompts/demos.txt \
 OUTPUT_ROOT=results/causal_forcing \
-NUM_OUTPUT_FRAMES=51 \
+NUM_OUTPUT_FRAMES=180 \
 LOCAL_ATTN_SIZE=51 \
 bash Causal-Forcing/run_baseline_matrix.sh
 ```

@@ -139,11 +139,14 @@ python Causal-Forcing/inference.py \
   --checkpoint_path /path/to/causal_forcing.pt \
   --data_path Causal-Forcing/prompts/demos.txt \
   --output_folder results/causal_forcing/RTN_INT4 \
-  --num_output_frames 21 \
+  --num_output_frames 180 \
   --method RTN_INT4 \
   --block_size 16 \
   --use_ema
 ```
+
+`--num_output_frames` 是 latent 帧数；180 latent 帧对应 717 像素帧
+（44.8s @ 16fps），与长视频 causal_forcing 结果对齐。
 
 文生视频使用 `Causal-Forcing/prompts/demos.txt` 等 prompt 文件。图生视频使用 `--i2v`，并传入原 Causal-Forcing loader 支持的图像 prompt 数据集。
 
@@ -169,7 +172,7 @@ CONFIG_PATH=Causal-Forcing/configs/causal_forcing_dmd_framewise.yaml \
 CHECKPOINT_PATH=/path/to/causal_forcing.pt \
 DATA_PATH=Causal-Forcing/prompts/demos.txt \
 OUTPUT_ROOT=results/causal_forcing \
-NUM_OUTPUT_FRAMES=51 \
+NUM_OUTPUT_FRAMES=180 \
 LOCAL_ATTN_SIZE=51 \
 bash Causal-Forcing/run_baseline_matrix.sh
 ```

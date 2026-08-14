@@ -6,7 +6,9 @@ set -euo pipefail
 : "${DATA_PATH:?Set DATA_PATH to the prompt file}"
 
 OUTPUT_ROOT="${OUTPUT_ROOT:-results/causal_forcing}"
-NUM_OUTPUT_FRAMES="${NUM_OUTPUT_FRAMES:-51}"
+# 180 latent frames = 717 pixel frames (44.8s @ 16fps), aligned with the
+# long-video causal_forcing results.
+NUM_OUTPUT_FRAMES="${NUM_OUTPUT_FRAMES:-180}"
 LOCAL_ATTN_SIZE="${LOCAL_ATTN_SIZE:-51}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 

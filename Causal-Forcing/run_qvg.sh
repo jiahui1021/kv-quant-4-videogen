@@ -6,7 +6,9 @@ CONFIG_PATH="${CONFIG_PATH:-Causal-Forcing/configs/causal_forcing_dmd_chunkwise_
 : "${DATA_PATH:?Set DATA_PATH to the prompt file}"
 
 METHOD="${METHOD:-QVG_INT2}"
-NUM_OUTPUT_FRAMES="${NUM_OUTPUT_FRAMES:-51}"
+# 180 latent frames = 717 pixel frames (44.8s @ 16fps), aligned with the
+# long-video causal_forcing results.
+NUM_OUTPUT_FRAMES="${NUM_OUTPUT_FRAMES:-180}"
 LOCAL_ATTN_SIZE="${LOCAL_ATTN_SIZE:-51}"
 OUTPUT_FOLDER="${OUTPUT_FOLDER:-results/qvg/${METHOD}}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
