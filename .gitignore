@@ -3,3 +3,4 @@ __pycache__/
 *.py[cod]
 tests/*
 Causal-Forcing/tests/
+.claude/
