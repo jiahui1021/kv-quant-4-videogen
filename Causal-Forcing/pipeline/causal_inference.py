@@ -1,4 +1,5 @@
 from typing import List, Optional
+import os
 import time
 import torch
 
@@ -62,6 +63,8 @@ class CausalInferencePipeline(torch.nn.Module):
         # `inference()`. Kept as attributes so callers can read them afterward.
         self.last_generation_time = None
         self.first_chunk_time = None
+        self.diffusion_generation_s = None
+        self.vae_decode_s = None
 
         print(f"KV inference with {self.num_frame_per_block} frames per block")
 
@@ -78,6 +81,7 @@ class CausalInferencePipeline(torch.nn.Module):
         low_memory: bool = False,
         rectified_tf = False,
         report_timing: bool = False,
+        retain_final_cache: bool = False,
     ) -> torch.Tensor:
         """
         Perform inference on the given noise and text prompts.
@@ -90,6 +94,9 @@ class CausalInferencePipeline(torch.nn.Module):
                 If num_input_frames is 1, perform image to video.
                 If num_input_frames is greater than 1, perform video extension.
             return_latents (bool): Whether to return the latents.
+            retain_final_cache (bool): Keep the final clean cache state after
+                the rollout. The formal benchmark enables this explicitly;
+                the legacy pipeline already performs the final clean refresh.
         Outputs:
             video (torch.Tensor): The generated video tensor of shape
                 (batch_size, num_output_frames, num_channels, height, width).
@@ -114,12 +121,6 @@ class CausalInferencePipeline(torch.nn.Module):
         # after the prompt's context length is known, before any cache write.
         ensure_qvg_capacity(self, num_output_frames)
 
-        # Optional: start generation timer (excludes VAE decode). Only runs
-        # when the caller explicitly opts in.
-        if report_timing:
-            torch.cuda.synchronize()
-            self._gen_start_time = time.time()
-
         conditional_dict = self.text_encoder(
             text_prompts=text_prompts
         )
@@ -134,7 +135,7 @@ class CausalInferencePipeline(torch.nn.Module):
             dtype=noise.dtype
         )
 
-        # Set up profiling if requested
+        # Set up profiling if requested.
         if profile:
             init_start = torch.cuda.Event(enable_timing=True)
             init_end = torch.cuda.Event(enable_timing=True)
@@ -217,11 +218,36 @@ class CausalInferencePipeline(torch.nn.Module):
             torch.cuda.synchronize()
             diffusion_start.record()
 
+        # Start after text encoding, cache initialization, and any context
+        # refresh, immediately before the autoregressive temporal loop. This
+        # is the shared diffusion-only benchmark interval.
+        if report_timing:
+            torch.cuda.synchronize()
+            diffusion_started = time.perf_counter()
+
         # Step 3: Temporal denoising loop
         all_num_frames = [self.num_frame_per_block] * num_blocks
         if self.independent_first_frame and initial_latent is None:
             all_num_frames = [1] + all_num_frames
         for block_index, current_num_frames in enumerate(tqdm.tqdm(all_num_frames)):
+            if (
+                os.environ.get("CAUSAL_FORCING_BENCHMARK") == "1"
+                and block_index in {1, 8, 16, 32, 59}
+            ):
+                current_end_frame = current_start_frame + current_num_frames
+                attention_start_frame = (
+                    0
+                    if self.local_attn_size == -1
+                    else max(0, current_end_frame - int(self.local_attn_size))
+                )
+                print(
+                    "[AttentionCheck] "
+                    f"block={block_index} "
+                    f"current_end_frame={current_end_frame} "
+                    f"attention_start_frame={attention_start_frame} "
+                    f"attention_length_frames={current_end_frame - attention_start_frame}",
+                    flush=True,
+                )
             # QVG compresses finalized history at generation-block boundaries.
             # The block about to be denoised remains mutable BF16.
             maybe_quantize_qvg_history(
@@ -329,14 +355,22 @@ class CausalInferencePipeline(torch.nn.Module):
             noise = torch.randn_like(output).to(output.device)
             output -= mean
 
-        # Record diffusion time (excluding VAE decode).
+        # Record diffusion time after the final clean refresh and before VAE
+        # decoding. This is the primary benchmark metric.
         if report_timing:
             torch.cuda.synchronize()
-            self.last_generation_time = time.time() - self._gen_start_time
+            self.diffusion_generation_s = time.perf_counter() - diffusion_started
+            self.last_generation_time = self.diffusion_generation_s
 
         # Step 4: Decode the output
+        if report_timing:
+            torch.cuda.synchronize()
+            vae_started = time.perf_counter()
         video = self.vae.decode_to_pixel(output, use_cache=False)
         video = (video * 0.5 + 0.5).clamp(0, 1)
+        if report_timing:
+            torch.cuda.synchronize()
+            self.vae_decode_s = time.perf_counter() - vae_started
 
         if profile:
             # End VAE timing and synchronize CUDA

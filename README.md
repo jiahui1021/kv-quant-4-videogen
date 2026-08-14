@@ -159,24 +159,23 @@ bash Causal-Forcing/run_qvg.sh
 ```
 
 The default is QVG_INT2; use `METHOD=QVG_INT4` for INT4. The launcher uses the
-chunkwise 180-latent-frame configuration (717 pixel frames) and currently
-supports T2V only.
+formal chunkwise workload (717 pixel frames / 180 latent frames / 180-frame
+full-history attention) and currently supports T2V only.
 
 For text-to-video, use a prompt file such as `Causal-Forcing/prompts/demos.txt`. For image-to-video, add `--i2v` and pass an image-prompt dataset supported by the original Causal-Forcing loader.
 
 ### 2. Run the complete Causal-Forcing matrix
 
 ```bash
-CONFIG_PATH=Causal-Forcing/configs/causal_forcing_dmd_framewise.yaml \
+CONFIG_PATH=Causal-Forcing/configs/causal_forcing_dmd_chunkwise.yaml \
 CHECKPOINT_PATH=/path/to/causal_forcing.pt \
 DATA_PATH=Causal-Forcing/prompts/demos.txt \
 OUTPUT_ROOT=results/causal_forcing \
-NUM_OUTPUT_FRAMES=180 \
-LOCAL_ATTN_SIZE=51 \
 bash Causal-Forcing/run_baseline_matrix.sh
 ```
 
-The matrix script uses `--use_ema`. Remove that option from the script when using a checkpoint without EMA weights.
+Set `USE_EMA=1` when the checkpoint contains EMA weights; the formal launcher
+defaults to the regular `generator` weights so it matches the Tempokv launcher.
 
 ## Generation metrics
 
@@ -205,7 +204,12 @@ Causal-Forcing reports are stored under:
 <output_folder>/metrics_<method>_<prompt_idx>.json
 ```
 
-`end_to_end_generation_time_s` covers the generation call, decoding, and video writing. `peak_vram_bytes` is the maximum CUDA memory allocated during that video generation. Quantized runs also fail if the quantizer was never called, preventing a mislabeled BF16 run.
+`diffusion_generation_s` is the comparable main latency: it starts before the
+autoregressive denoising loop and ends after the final clean refresh, before
+VAE decoding. `end_to_end_generation_time_s` is retained for compatibility and
+includes VAE decoding. `peak_vram_bytes` is the maximum CUDA memory allocated
+during that video generation. Quantized runs also fail if the quantizer was
+never called, preventing a mislabeled BF16 run.
 
 Per-quantizer timing is disabled by default so it does not add synchronization or event overhead to the latency benchmark. Enable the optional CUDA-event breakdown only when needed:
 
@@ -219,7 +223,9 @@ physical BF16 chunks, centroids, cluster IDs, packed residuals, scales and
 zero-points separately, together with `resident_total_kv_bytes`,
 `uncompressed_reference_kv_bytes`, effective bits/value, QVG configuration and
 the pinned upstream commit. QVG resident bytes include both packed tensors and
-the BF16 tail.
+the BF16 tail. Effective bits/value is computed as
+`resident_total_kv_bytes * 8 / resident_logical_kv_values`; it is a resident
+storage measurement, not the nominal INT2/INT4 setting.
 
 ## Recommended validation order
 

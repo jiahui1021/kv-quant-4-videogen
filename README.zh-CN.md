@@ -163,21 +163,22 @@ DATA_PATH=Causal-Forcing/prompts/demos.txt \
 bash Causal-Forcing/run_qvg.sh
 ```
 
-默认运行 QVG_INT2；设置 `METHOD=QVG_INT4` 可运行 INT4。
+默认运行 QVG_INT2；设置 `METHOD=QVG_INT4` 可运行 INT4。launcher 默认使用正式
+chunkwise workload：717 pixel frames、180 latent frames、180-frame full-history attention，
+仅支持 T2V。
 
 ### 3. 批量运行 Causal-Forcing baseline
 
 ```bash
-CONFIG_PATH=Causal-Forcing/configs/causal_forcing_dmd_framewise.yaml \
+CONFIG_PATH=Causal-Forcing/configs/causal_forcing_dmd_chunkwise.yaml \
 CHECKPOINT_PATH=/path/to/causal_forcing.pt \
 DATA_PATH=Causal-Forcing/prompts/demos.txt \
 OUTPUT_ROOT=results/causal_forcing \
-NUM_OUTPUT_FRAMES=180 \
-LOCAL_ATTN_SIZE=51 \
 bash Causal-Forcing/run_baseline_matrix.sh
 ```
 
-批量脚本默认使用 `--use_ema`。如果 checkpoint 没有 EMA 权重，需要从脚本中移除该参数。
+checkpoint 包含 EMA 权重时设置 `USE_EMA=1`；正式 launcher 默认使用普通
+`generator` 权重，与 Tempokv launcher 保持一致。
 
 ## 生成指标
 
@@ -206,7 +207,10 @@ Causal-Forcing 指标位置：
 <output_folder>/metrics_<method>_<prompt_idx>.json
 ```
 
-`end_to_end_generation_time_s` 覆盖生成调用、解码和视频写入；`peak_vram_bytes` 是该视频生成过程中的最高 CUDA 已分配显存。量化方法如果从未实际触发量化，会直接报错，避免把 BF16 结果误标成量化结果。
+`diffusion_generation_s` 是公平比较的主延迟指标：从自回归 denoising loop 开始，
+到最后一个 clean refresh 完成结束，不包含 VAE decode。`end_to_end_generation_time_s`
+保留用于兼容旧结果，并包含 VAE decode。`peak_vram_bytes` 是该视频生成过程中的最高
+CUDA 已分配显存。量化方法如果从未实际触发量化，会直接报错，避免把 BF16 结果误标成量化结果。
 
 为避免影响 latency benchmark，量化器的逐次耗时统计默认关闭，不会在每次量化或反量化时插入同步或事件开销。需要查看 CUDA event 耗时分解时再显式开启：
 
@@ -219,6 +223,9 @@ Causal-Forcing 通用 baseline 按 resident cache capacity 统计；QVG 额外�
 BF16 chunk、centroid、cluster ID、packed residual、scale 和 zero-point 的物理显存，
 并输出 `resident_total_kv_bytes`、`uncompressed_reference_kv_bytes`、effective bits/value、
 QVG 配置和固定 upstream commit；resident bytes 包含压缩数据和 BF16 尾部。
+effective bits/value 的计算为
+`resident_total_kv_bytes * 8 / resident_logical_kv_values`，表示实际驻留存储，
+不等同于 nominal INT2/INT4 位宽。
 
 ## 推荐验证顺序
 

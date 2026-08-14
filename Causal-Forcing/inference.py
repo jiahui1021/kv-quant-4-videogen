@@ -90,6 +90,11 @@ parser.add_argument(
     default=None,
     help="Override the causal model attention window in latent frames",
 )
+parser.add_argument(
+    "--retain_final_cache",
+    action="store_true",
+    help="run the final clean refresh before releasing the cache",
+)
 args = parser.parse_args()
 
 # Initialize distributed inference
@@ -119,6 +124,55 @@ if args.local_attn_size is not None:
     if not hasattr(config, "model_kwargs") or config.model_kwargs is None:
         config.model_kwargs = OmegaConf.create({})
     config.model_kwargs.local_attn_size = int(args.local_attn_size)
+
+num_frame_per_block = int(getattr(config, "num_frame_per_block", 1))
+latent_frames = int(args.num_output_frames)
+if latent_frames % num_frame_per_block:
+    raise ValueError(
+        "num_output_frames must be divisible by num_frame_per_block for the "
+        "formal Causal-Forcing workload"
+    )
+qvg_enabled = args.method.startswith("QVG_")
+effective_local_attn_size = int(
+    args.local_attn_size
+    if args.local_attn_size is not None
+    else getattr(config.model_kwargs, "local_attn_size", -1)
+)
+benchmark_config = {
+    "method": args.method,
+    "pixel_frames": latent_frames * 4 - 3,
+    "latent_frames": latent_frames,
+    "num_frame_per_block": num_frame_per_block,
+    "num_blocks": latent_frames // num_frame_per_block,
+    "local_attn_size": effective_local_attn_size,
+    "attention_mode": (
+        "full_history"
+        if effective_local_attn_size in (-1, latent_frames)
+        else "windowed"
+    ),
+    "compression_span_frames": (
+        int(args.qvg_quant_factor * num_frame_per_block)
+        if qvg_enabled
+        else None
+    ),
+    "seed": int(args.seed),
+    "checkpoint": str(Path(args.checkpoint_path).expanduser().resolve()),
+    "prompt_file": str(Path(args.data_path).expanduser().resolve()),
+}
+if qvg_enabled:
+    benchmark_config.update(
+        {
+            "qvg_quant_factor": int(args.qvg_quant_factor),
+            "qvg_num_k_centroids": int(args.qvg_num_k_centroids),
+            "qvg_num_v_centroids": int(args.qvg_num_v_centroids),
+            "qvg_kmeans_max_iters": int(args.qvg_kmeans_max_iters),
+            "qvg_quant_block_size": int(args.qvg_quant_block_size),
+            "qvg_num_prq_stages": int(args.qvg_num_prq_stages),
+        }
+    )
+print("[BenchmarkConfig]", flush=True)
+for key, value in benchmark_config.items():
+    print(f"{key} = {value}", flush=True)
 
 # Initialize pipeline
 if hasattr(config, 'denoising_step_list'):
@@ -151,7 +205,6 @@ else:
 pipeline.generator.to(device=gpu)
 pipeline.vae.to(device=gpu)
 
-qvg_enabled = args.method.startswith("QVG_")
 if qvg_enabled:
     if args.i2v:
         raise NotImplementedError(
@@ -216,11 +269,6 @@ else:
 num_prompts = len(dataset)
 print(f"Number of prompts: {num_prompts}")
 
-if args.report_timing and num_prompts < 2:
-    print(f"[WARN] --report_timing requires at least 2 prompts "
-          f"(got {num_prompts}); timing disabled.")
-    args.report_timing = False
-
 if dist.is_initialized():
     sampler = DistributedSampler(dataset, shuffle=False, drop_last=True)
 else:
@@ -265,6 +313,7 @@ def _write_metrics(
     start_time: float,
     output_folder: str,
     block_size: int,
+    benchmark_config: dict[str, object],
 ) -> None:
     torch.cuda.synchronize(device)
     is_qvg = method_name.startswith("QVG_")
@@ -295,10 +344,22 @@ def _write_metrics(
         ),
         "end_to_end_generation_time_s": float(elapsed),
         "wall_clock_runtime_s": float(elapsed),
+        "diffusion_generation_s": (
+            None
+            if getattr(pipeline, "diffusion_generation_s", None) is None
+            else float(pipeline.diffusion_generation_s)
+        ),
+        "vae_decode_s": (
+            None
+            if getattr(pipeline, "vae_decode_s", None) is None
+            else float(pipeline.vae_decode_s)
+        ),
+        "benchmark_config": benchmark_config,
         "peak_vram_bytes": peak_vram_bytes,
         "peak_vram_gb": peak_vram_bytes / 1024**3,
         "resident_bf16_kv_bytes": int(bf16_kv_bytes),
         "resident_compressed_kv_bytes": int(compressed_kv_bytes),
+        "resident_logical_kv_values": int(bf16_kv_bytes // 2),
         # Keep the previous keys for existing result readers. Their values now
         # use resident-capacity accounting as well.
         "active_bf16_kv_bytes": int(bf16_kv_bytes),
@@ -339,6 +400,7 @@ def _write_metrics(
                 "uncompressed_reference_kv_bytes": int(
                     qvg_memory.bf16_equivalent_bytes
                 ),
+                "resident_logical_kv_values": int(qvg_memory.logical_values),
                 "effective_kv_bits_per_value": float(
                     qvg_memory.physical_bytes
                     * 8
@@ -423,13 +485,14 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
     torch.cuda.reset_peak_memory_stats(device)
     generation_start_time = time.perf_counter()
 
-    sample_report_timing = args.report_timing and i >= 1
+    sample_report_timing = args.report_timing
     video, latents = pipeline.inference(
         noise=sampled_noise,
         text_prompts=prompts,
         return_latents=True,
         initial_latent=initial_latent,
         report_timing=sample_report_timing,
+        retain_final_cache=args.retain_final_cache,
     )
     if sample_report_timing:
         latency = pipeline.first_chunk_time
@@ -464,6 +527,7 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         start_time=generation_start_time,
         output_folder=args.output_folder,
         block_size=args.block_size,
+        benchmark_config=benchmark_config,
     )
 
        

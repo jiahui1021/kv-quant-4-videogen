@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import os
 from pathlib import Path
 import sys
 import time
@@ -426,6 +427,16 @@ def maybe_quantize_qvg_history(
         return False
     quantize_qvg_span(pipeline, span[0], span[1])
     scheduled.add(span)
+    if os.environ.get("CAUSAL_FORCING_BENCHMARK") == "1":
+        frame_tokens = int(pipeline.frame_seq_length)
+        print(
+            "[QVGSchedule] "
+            f"block={block_index} "
+            f"start_frame={span[0] // frame_tokens} "
+            f"end_frame={span[1] // frame_tokens} "
+            f"num_frames={(span[1] - span[0]) // frame_tokens}",
+            flush=True,
+        )
     _qvg_debug(
         f"quantized span tokens=[{span[0]},{span[1]}) "
         f"at generation block {block_index}"
@@ -707,6 +718,7 @@ def qvg_metrics(pipeline) -> dict[str, Any]:
         "qvg_uncompressed_reference_kv_bytes": int(
             memory.bf16_equivalent_bytes
         ),
+        "qvg_resident_logical_kv_values": int(memory.logical_values),
         "qvg_effective_kv_bits_per_value": (
             memory.physical_bytes * 8 / max(memory.logical_values, 1)
         ),

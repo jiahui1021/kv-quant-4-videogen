@@ -6,11 +6,21 @@ set -euo pipefail
 : "${DATA_PATH:?Set DATA_PATH to the prompt file}"
 
 OUTPUT_ROOT="${OUTPUT_ROOT:-results/causal_forcing}"
-# 180 latent frames = 717 pixel frames (44.8s @ 16fps), aligned with the
-# long-video causal_forcing results.
 NUM_OUTPUT_FRAMES="${NUM_OUTPUT_FRAMES:-180}"
-LOCAL_ATTN_SIZE="${LOCAL_ATTN_SIZE:-51}"
+LOCAL_ATTN_SIZE="${LOCAL_ATTN_SIZE:-180}"
+RETAIN_FINAL_CACHE="${RETAIN_FINAL_CACHE:-1}"
+USE_EMA="${USE_EMA:-0}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
+
+if [[ "$RETAIN_FINAL_CACHE" != 0 && "$RETAIN_FINAL_CACHE" != 1 ]]; then
+  echo "RETAIN_FINAL_CACHE must be 0 or 1" >&2
+  exit 2
+fi
+if [[ "$USE_EMA" != 0 && "$USE_EMA" != 1 ]]; then
+  echo "USE_EMA must be 0 or 1" >&2
+  exit 2
+fi
+export CAUSAL_FORCING_BENCHMARK="${CAUSAL_FORCING_BENCHMARK:-1}"
 
 METHODS=(
   BF16
@@ -39,6 +49,8 @@ for method in "${METHODS[@]}"; do
   else
     method_args=(--method "${method}" --block_size 16)
   fi
+  [[ "$RETAIN_FINAL_CACHE" == 1 ]] && method_args+=(--retain_final_cache)
+  [[ "$USE_EMA" == 1 ]] && method_args+=(--use_ema)
   "${PYTHON_BIN}" Causal-Forcing/inference.py \
     --config_path "${CONFIG_PATH}" \
     --checkpoint_path "${CHECKPOINT_PATH}" \
@@ -46,6 +58,6 @@ for method in "${METHODS[@]}"; do
     --output_folder "${OUTPUT_ROOT}/${method}" \
     --num_output_frames "${NUM_OUTPUT_FRAMES}" \
     --local_attn_size "${LOCAL_ATTN_SIZE}" \
-    "${method_args[@]}" \
-    --use_ema
+    --report_timing \
+    "${method_args[@]}"
 done
