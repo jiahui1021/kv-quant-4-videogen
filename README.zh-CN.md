@@ -1,6 +1,6 @@
 # LongCat 与 Causal-Forcing 的 KV 量化
 
-本仓库为 LongCat 和 Causal-Forcing 提供统一的 KV-cache 量化实现，支持 RTN、KIVI 和 KV-only QuaRot。
+本仓库为 LongCat 和 Causal-Forcing 提供统一的 KV-cache 量化实现，支持 RTN、KIVI 和 KV-only QuaRot；Causal-Forcing 额外提供官方 QVG INT2 和 INT4 baseline。
 
 [English README](README.md)
 
@@ -12,8 +12,11 @@
 | `RTN_INT4` / `RTN_INT2` | 4 / 2 | Round-to-nearest 对称量化 |
 | `KIVI_INT4` / `KIVI_INT2` | 4 / 2 | KIVI 风格的 K/V 非对称量化 |
 | `QUAROT_KV_INT4` / `QUAROT_KV_INT2` | 4 / 2 | Hadamard 旋转后进行 KV 量化 |
+| `QVG_INT2` / `QVG_INT4` | 2 / 4 | 官方 Quant-VideoGen semantic smoothing + progressive residual quantization（仅 Causal-Forcing） |
 
-所有量化方法默认使用 `block_size=16`。LongCat 和 Causal-Forcing 共同调用根目录 [`kv_quant/`](kv_quant/) 中的实现，模型目录只保留 cache layout 适配和运行时接入代码。
+共享量化器默认使用 `block_size=16`；QVG 保留官方 `quant_block_size=64` 和每 8 个
+generation chunk 的独立 schedule。LongCat 和 Causal-Forcing 共同调用根目录
+[`kv_quant/`](kv_quant/) 中的共享实现，QVG 专用代码放在 Causal-Forcing adapter 中。
 
 ## 目录结构
 
@@ -23,11 +26,13 @@ kv-quant-4-videogen/
 ├── LongCat/
 │   ├── kv_quant_adapter.py           # LongCat [B,H,S,D] layout 适配器
 │   ├── run_long_t2v.py               # LongCat 生成入口
-│   └── run_baseline_matrix.sh        # 批量运行 7 种方法
+│   └── run_baseline_matrix.sh        # 批量运行共享的 7 种方法
 ├── Causal-Forcing/
 │   ├── kv_quant_runtime.py           # Causal cache 初始化与 reset
 │   ├── inference.py                  # Causal 生成入口
-│   └── run_baseline_matrix.sh        # 批量运行 7 种方法
+│   ├── qvg_runtime.py                # 官方 QVG adapter 与 schedule
+│   └── run_baseline_matrix.sh        # 运行共享方法和 QVG_INT2/INT4
+├── third_party/Quant-VideoGen/       # 固定版本的官方 QVG codec
 └── Self-Forcing/                     # 原有 Self-Forcing 实现
 ```
 
@@ -98,7 +103,7 @@ torchrun --nproc_per_node=1 LongCat/run_long_t2v.py \
   --prompt "A person walking through a sunlit forest"
 ```
 
-只替换 `--method` 即可比较 7 种 baseline。prompt、seed、初始视频、帧数设置和 context parallel 设置必须保持一致。
+只替换 `--method` 即可比较 7 种共享 baseline。prompt、seed、初始视频、帧数设置和 context parallel 设置必须保持一致。
 
 显存不足时可以把 `--no_offload_kv_cache` 换成 `--offload_kv_cache`。
 
@@ -144,7 +149,36 @@ python Causal-Forcing/inference.py \
 
 frame-wise 和 chunk-wise 模型通过 `--config_path` 选择，量化参数保持不变。
 
-### 2. 批量运行 Causal-Forcing baseline
+### 2. QVG_INT2 / QVG_INT4
+
+安装 [`Causal-Forcing/requirements-qvg.txt`](Causal-Forcing/requirements-qvg.txt)
+中列出的 Triton 依赖后，可以运行官方 QVG INT2 或 INT4 baseline。示例使用 INT2；将
+`--method QVG_INT2` 改为 `--method QVG_INT4` 即可运行 INT4：
+
+```bash
+python Causal-Forcing/inference.py \
+  --config_path Causal-Forcing/configs/causal_forcing_dmd_framewise.yaml \
+  --checkpoint_path /path/to/causal_forcing.pt \
+  --data_path Causal-Forcing/prompts/demos.txt \
+  --output_folder results/causal_forcing/QVG_INT2 \
+  --num_output_frames 21 \
+  --method QVG_INT2 \
+  --qvg_quant_factor 8 \
+  --qvg_num_k_centroids 256 \
+  --qvg_num_v_centroids 256 \
+  --qvg_kmeans_max_iters 2 \
+  --qvg_quant_block_size 64 \
+  --qvg_num_prq_stages 1 \
+  --use_ema
+```
+
+QVG 缓存 normalized pre-RoPE K 和原始 V，每累计 8 个已完成的生成 chunk
+后，在下一个 block 开始前压缩。当前 denoising block 始终保留 BF16，已压缩
+span 不会重新量化。INT2 和 INT4 使用相同的官方 cache 生命周期，要求
+`sink_size=0` 且 attention window 足以保留最初 8 个 generation chunk。当前只验证
+few-step `CausalInferencePipeline`；diffusion pipeline 和 QVG-Pro 尚未作为验证通过的方法提供。
+
+### 3. 批量运行 Causal-Forcing baseline
 
 ```bash
 CONFIG_PATH=Causal-Forcing/configs/causal_forcing_dmd_framewise.yaml \
@@ -193,12 +227,15 @@ Causal-Forcing 指标位置：
 --profile-quant-timing        # Self-Forcing
 ```
 
-Causal-Forcing 的 KV 显存报告统一按预分配 cache capacity 统计 BF16 和压缩结果。
+Causal-Forcing 通用 baseline 按 resident cache capacity 统计；QVG 额外分别报告
+BF16 chunk、centroid、cluster ID、packed residual、scale 和 zero-point 的物理显存，
+并输出 `resident_total_kv_bytes`、`uncompressed_reference_kv_bytes`、effective bits/value、
+QVG 配置和固定 upstream commit。
 
 ## 推荐验证顺序
 
 ```text
-BF16 → RTN_INT4 → KIVI_INT4 → QUAROT_KV_INT4 → RTN_INT2 → KIVI_INT2 → QUAROT_KV_INT2
+BF16 → RTN_INT4 → KIVI_INT4 → QUAROT_KV_INT4 → RTN_INT2 → KIVI_INT2 → QUAROT_KV_INT2 → QVG_INT2 → QVG_INT4
 ```
 
 第一阶段固定 `context_parallel_size=1`、关闭 compilation，并让所有方法使用同一个初始视频。基础矩阵通过后，再逐项开启 CPU offload、context parallel、attention sink 和 local attention。

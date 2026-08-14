@@ -1,6 +1,6 @@
 # KV Quantization for LongCat and Causal-Forcing
 
-This repository provides one shared implementation of KV-cache quantization for LongCat and Causal-Forcing. The supported baselines are RTN, KIVI, and KV-only QuaRot.
+This repository provides one shared implementation of KV-cache quantization for LongCat and Causal-Forcing. The shared baselines are RTN, KIVI, and KV-only QuaRot; Causal-Forcing additionally exposes the official QVG INT2 and INT4 baselines.
 
 [中文说明](README.zh-CN.md)
 
@@ -12,8 +12,12 @@ This repository provides one shared implementation of KV-cache quantization for 
 | `RTN_INT4` / `RTN_INT2` | 4 / 2 | Round-to-nearest symmetric quantization |
 | `KIVI_INT4` / `KIVI_INT2` | 4 / 2 | KIVI-style asymmetric key/value quantization |
 | `QUAROT_KV_INT4` / `QUAROT_KV_INT2` | 4 / 2 | Hadamard rotation followed by KV quantization |
+| `QVG_INT2` / `QVG_INT4` | 2 / 4 | Official Quant-VideoGen semantic smoothing + progressive residual quantization (Causal-Forcing only) |
 
-All quantized methods use `block_size=16` by default. LongCat and Causal-Forcing call the same implementation in [`kv_quant/`](kv_quant/); model-specific code only handles cache layout and runtime integration.
+The shared quantizers use `block_size=16` by default. QVG keeps the official
+`quant_block_size=64` and its own eight-chunk schedule. LongCat and
+Causal-Forcing call the shared implementation in [`kv_quant/`](kv_quant/);
+QVG-specific code stays in the Causal-Forcing adapter.
 
 ## Directory layout
 
@@ -23,11 +27,13 @@ kv-quant-4-videogen/
 ├── LongCat/
 │   ├── kv_quant_adapter.py           # LongCat [B,H,S,D] layout adapter
 │   ├── run_long_t2v.py               # LongCat generation entry point
-│   └── run_baseline_matrix.sh        # Run all seven methods
+│   └── run_baseline_matrix.sh        # Run the shared seven methods
 ├── Causal-Forcing/
 │   ├── kv_quant_runtime.py           # Causal cache setup and reset helpers
 │   ├── inference.py                  # Causal generation entry point
-│   └── run_baseline_matrix.sh        # Run all seven methods
+│   ├── qvg_runtime.py                # Official QVG adapter and schedule
+│   └── run_baseline_matrix.sh        # Run shared methods plus QVG_INT2/INT4
+├── third_party/Quant-VideoGen/       # Pinned official QVG codec
 └── Self-Forcing/                     # Existing Self-Forcing implementation
 ```
 
@@ -98,7 +104,7 @@ torchrun --nproc_per_node=1 LongCat/run_long_t2v.py \
   --prompt "A person walking through a sunlit forest"
 ```
 
-Change only `--method` to compare the seven baselines. Keep the prompt, seed, initial video, frame settings, and context-parallel settings unchanged.
+Change only `--method` to compare the seven shared baselines. Keep the prompt, seed, initial video, frame settings, and context-parallel settings unchanged.
 
 For lower GPU memory usage, replace `--no_offload_kv_cache` with `--offload_kv_cache`.
 
@@ -139,6 +145,36 @@ python Causal-Forcing/inference.py \
   --block_size 16 \
   --use_ema
 ```
+
+For the official QVG baselines, install the additional dependencies in
+`Causal-Forcing/requirements-qvg.txt` and run:
+
+```bash
+python Causal-Forcing/inference.py \
+  --config_path Causal-Forcing/configs/causal_forcing_dmd_framewise.yaml \
+  --checkpoint_path /path/to/causal_forcing.pt \
+  --data_path Causal-Forcing/prompts/demos.txt \
+  --output_folder results/causal_forcing/QVG_INT2 \
+  --num_output_frames 21 \
+  --method QVG_INT2 \
+  --qvg_quant_factor 8 \
+  --qvg_num_k_centroids 256 \
+  --qvg_num_v_centroids 256 \
+  --qvg_kmeans_max_iters 2 \
+  --qvg_quant_block_size 64 \
+  --qvg_num_prq_stages 1 \
+  --use_ema
+```
+
+QVG stores normalized pre-RoPE K and raw V in the pinned official
+`Quant-VideoGen` `ChunkedKVCache`. It compresses eight finalized generation
+chunks at the next block boundary; the active denoising block stays BF16 and
+previous compressed spans are immutable. The first migration is validated for
+the few-step `CausalInferencePipeline` with `sink_size=0` and an attention
+window large enough to retain the first eight generation chunks. Both
+`QVG_INT2` and `QVG_INT4` use the same official cache lifecycle; select the
+bit width with `--method`. The diffusion pipeline and QVG-Pro are not exposed
+as validated methods.
 
 For text-to-video, use a prompt file such as `Causal-Forcing/prompts/demos.txt`. For image-to-video, add `--i2v` and pass an image-prompt dataset supported by the original Causal-Forcing loader.
 
@@ -193,12 +229,16 @@ Per-quantizer timing is disabled by default so it does not add synchronization o
 --profile-quant-timing        # Self-Forcing
 ```
 
-Causal-Forcing KV memory reports use the resident preallocated cache capacity for both BF16 and compressed values.
+Causal-Forcing generic baselines report resident cache capacity. QVG reports
+physical BF16 chunks, centroids, cluster IDs, packed residuals, scales and
+zero-points separately, together with `resident_total_kv_bytes`,
+`uncompressed_reference_kv_bytes`, effective bits/value, QVG configuration and
+the pinned upstream commit.
 
 ## Recommended validation order
 
 ```text
-BF16 → RTN_INT4 → KIVI_INT4 → QUAROT_KV_INT4 → RTN_INT2 → KIVI_INT2 → QUAROT_KV_INT2
+BF16 → RTN_INT4 → KIVI_INT4 → QUAROT_KV_INT4 → RTN_INT2 → KIVI_INT2 → QUAROT_KV_INT2 → QVG_INT2 → QVG_INT4
 ```
 
 Start with `context_parallel_size=1`, no compilation, and the same initial video. Enable CPU offload, context parallelism, attention sinks, and local attention only after the basic matrix is working.

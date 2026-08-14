@@ -1,0 +1,6 @@
+# Official Quant-VideoGen codec dependencies for the QVG_INT2/INT4 baselines.
+# Keep the repository's existing PyTorch/CUDA environment; do not force a
+# global torch reinstall. Install a Triton version compatible with that torch.
+triton>=2.2
+loguru>=0.7
+termcolor>=2.3

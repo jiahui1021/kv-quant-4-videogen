@@ -17,17 +17,31 @@ METHODS=(
   KIVI_INT2
   QUAROT_KV_INT4
   QUAROT_KV_INT2
+  QVG_INT2
+  QVG_INT4
 )
 
 for method in "${METHODS[@]}"; do
   echo "===== Causal-Forcing ${method} ====="
+  if [[ "${method}" == QVG_* ]]; then
+    method_args=(
+      --method "${method}"
+      --qvg_quant_factor 8
+      --qvg_num_k_centroids 256
+      --qvg_num_v_centroids 256
+      --qvg_kmeans_max_iters 2
+      --qvg_quant_block_size 64
+      --qvg_num_prq_stages 1
+    )
+  else
+    method_args=(--method "${method}" --block_size 16)
+  fi
   "${PYTHON_BIN}" Causal-Forcing/inference.py \
     --config_path "${CONFIG_PATH}" \
     --checkpoint_path "${CHECKPOINT_PATH}" \
     --data_path "${DATA_PATH}" \
     --output_folder "${OUTPUT_ROOT}/${method}" \
     --num_output_frames "${NUM_OUTPUT_FRAMES}" \
-    --method "${method}" \
-    --block_size 16 \
+    "${method_args[@]}" \
     --use_ema
 done

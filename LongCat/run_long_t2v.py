@@ -855,7 +855,10 @@ def _parse_args():
         "--method",
         type=str,
         default="BF16",
-        choices=list(SUPPORTED_METHODS),
+        # QVG is a Causal-Forcing-only backend; LongCat must not advertise it.
+        choices=[
+            method for method in SUPPORTED_METHODS if not method.startswith("QVG_")
+        ],
         help="Shared KV-cache method used by LongCat generation",
     )
     quant_group.add_argument(

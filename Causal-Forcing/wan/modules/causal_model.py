@@ -12,6 +12,7 @@ from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from torch.nn.attention.flex_attention import BlockMask
 from diffusers.models.modeling_utils import ModelMixin
+from qvg_runtime import read_qvg_cache
 import torch.nn as nn
 import torch
 import math
@@ -57,6 +58,57 @@ def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
         # append to collection
         output.append(x_i)
     return torch.stack(output).type_as(x)
+
+
+def causal_rope_apply_long_input(
+    x,
+    grid_sizes,
+    freqs,
+    start_frame=0,
+):
+    """Apply causal RoPE to cached raw K using absolute frame positions."""
+    n, c = x.size(2), x.size(3) // 2
+    split_freqs = freqs.split(
+        [c - 2 * (c // 3), c // 3, c // 3], dim=1
+    )
+    result = torch.empty_like(x)
+
+    for i, (_, h, w) in enumerate(grid_sizes.tolist()):
+        tokens_per_frame = int(h * w)
+        if tokens_per_frame <= 0:
+            result[i].copy_(x[i])
+            continue
+        if x.shape[1] % tokens_per_frame != 0:
+            raise ValueError(
+                "Cached QVG sequence length must contain complete frames"
+            )
+        num_frames = x.shape[1] // tokens_per_frame
+        x_i = torch.view_as_complex(
+            x[i].to(torch.float64).reshape(x.shape[1], n, -1, 2)
+        )
+        temporal = split_freqs[0][start_frame:start_frame + num_frames]
+        if temporal.shape[0] != num_frames:
+            raise ValueError(
+                "QVG absolute RoPE position exceeds the available frequency table"
+            )
+        freqs_i = torch.cat(
+            [
+                temporal.view(num_frames, 1, 1, -1).expand(
+                    num_frames, h, w, -1
+                ),
+                split_freqs[1][:h]
+                .view(1, h, 1, -1)
+                .expand(num_frames, h, w, -1),
+                split_freqs[2][:w]
+                .view(1, 1, w, -1)
+                .expand(num_frames, h, w, -1),
+            ],
+            dim=-1,
+        ).reshape(x.shape[1], 1, -1)
+        rotated = torch.view_as_real(x_i * freqs_i).flatten(2)
+        result[i].copy_(rotated.to(dtype=x.dtype))
+
+    return result
 
 
 class CausalWanSelfAttention(nn.Module):
@@ -173,6 +225,78 @@ class CausalWanSelfAttention(nn.Module):
         kv_cache["kv_cache_size"] = int(cache_size)
         return x, local_end_index
 
+    def _attention_with_qvg_cache(
+        self,
+        roped_query,
+        raw_key,
+        value,
+        kv_cache,
+        grid_sizes,
+        freqs,
+        current_start,
+        current_end,
+        frame_seqlen,
+    ):
+        """Run attention from the independent pre-RoPE QVG cache path."""
+        cache_frame_seq = int(kv_cache["k"].frame_seq_length)
+        if cache_frame_seq != int(frame_seqlen):
+            raise ValueError(
+                "QVG cache frame_seq_length does not match the model grid: "
+                f"{cache_frame_seq} != {frame_seqlen}"
+            )
+        cache_size = int(kv_cache["k"].kv_cache_size)
+        if current_start % frame_seqlen or current_end % frame_seqlen:
+            raise ValueError("QVG cache writes must be frame-aligned")
+        if current_end > cache_size:
+            raise ValueError(
+                f"QVG cache capacity exceeded: {current_end} > {cache_size}"
+            )
+
+        immutable_end = max(
+            (
+                int(span["end_chunk"])
+                * int(kv_cache["k"].frame_seq_length)
+                for span in kv_cache["k"].quantized_spans
+            ),
+            default=0,
+        )
+        if current_start < immutable_end:
+            raise RuntimeError(
+                f"QVG cannot overwrite immutable history before token "
+                f"{immutable_end}; requested start is {current_start}"
+            )
+
+        # The same denoising block is deliberately overwritten at every
+        # timestep. Only finalized earlier spans are ever compressed.
+        kv_cache["k"].write(current_start, current_end, raw_key)
+        kv_cache["v"].write(current_start, current_end, value)
+
+        attention_start = max(0, current_end - int(self.max_attention_size))
+        attention_start = (attention_start // frame_seqlen) * frame_seqlen
+        # QVG keeps absolute token positions. Eviction may release a complete
+        # span, but a partial overlap intentionally keeps the shared codebook.
+        kv_cache["k"].evict_range(0, attention_start)
+        kv_cache["v"].evict_range(0, attention_start)
+        kv_cache["qvg_evicted_until"] = attention_start
+        stats = kv_cache["qvg_stats"]
+        cached_raw_key = read_qvg_cache(
+            kv_cache["k"], attention_start, current_end, stats
+        )
+        cached_value = read_qvg_cache(
+            kv_cache["v"], attention_start, current_end, stats
+        )
+        absolute_start_frame = attention_start // frame_seqlen
+        cached_roped_key = causal_rope_apply_long_input(
+            cached_raw_key,
+            grid_sizes,
+            freqs,
+            start_frame=absolute_start_frame,
+        ).type_as(value)
+        return (
+            attention(roped_query, cached_roped_key, cached_value),
+            current_end,
+        )
+
     def forward(
         self,
         x,
@@ -285,10 +409,9 @@ class CausalWanSelfAttention(nn.Module):
             current_start_frame = current_start // frame_seqlen
             roped_query = causal_rope_apply(
                 q, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
-            roped_key = causal_rope_apply(
-                k, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
 
             current_end = current_start + roped_query.shape[1]
+            cache_backend = kv_cache.get("cache_backend", "bf16")
             quantizer = kv_cache.get("quantizer")
             supports_incremental = (
                 quantizer is not None
@@ -296,7 +419,22 @@ class CausalWanSelfAttention(nn.Module):
                 and callable(getattr(quantizer, "append_kv", None))
                 and callable(getattr(quantizer, "materialize_kv", None))
             )
-            if supports_incremental:
+            if cache_backend == "qvg":
+                x, local_end_index = self._attention_with_qvg_cache(
+                    roped_query=roped_query,
+                    raw_key=k,
+                    value=v,
+                    kv_cache=kv_cache,
+                    grid_sizes=grid_sizes,
+                    freqs=freqs,
+                    current_start=current_start,
+                    current_end=current_end,
+                    frame_seqlen=frame_seqlen,
+                )
+            elif supports_incremental:
+                roped_key = causal_rope_apply(
+                    k, grid_sizes, freqs,
+                    start_frame=current_start_frame).type_as(v)
                 kv_cache_size = kv_cache.get("kv_cache_size")
                 if kv_cache_size is None:
                     kv_cache_size = int(self.max_attention_size)
@@ -312,6 +450,9 @@ class CausalWanSelfAttention(nn.Module):
                     frame_seqlen=frame_seqlen,
                 )
             else:
+                roped_key = causal_rope_apply(
+                    k, grid_sizes, freqs,
+                    start_frame=current_start_frame).type_as(v)
                 if quantizer is not None:
                     kv_cache_size = kv_cache.get("kv_cache_size")
                     if kv_cache_size is None:

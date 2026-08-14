@@ -11,6 +11,8 @@ SUPPORTED_METHODS = (
     "KIVI_INT2",
     "QUAROT_KV_INT4",
     "QUAROT_KV_INT2",
+    "QVG_INT2",
+    "QVG_INT4",
 )
 
 

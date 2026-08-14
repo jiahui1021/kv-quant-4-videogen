@@ -35,6 +35,14 @@ from kv_quant_runtime import (
     reset_quantized_kv_cache,
     resident_kv_memory_bytes,
 )
+from qvg_runtime import (
+    QVGConfig,
+    attach_qvg_to_pipeline,
+    qvg_metrics,
+    qvg_memory_breakdown,
+    qvg_resident_memory_bytes,
+    reset_qvg_cache,
+)
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--config_path", type=str, help="Path to the config file")
@@ -65,6 +73,12 @@ parser.add_argument(
     action="store_true",
     help="Record optional quantize/dequantize CUDA-event breakdowns",
 )
+parser.add_argument("--qvg_quant_factor", type=int, default=8)
+parser.add_argument("--qvg_num_k_centroids", type=int, default=256)
+parser.add_argument("--qvg_num_v_centroids", type=int, default=256)
+parser.add_argument("--qvg_kmeans_max_iters", type=int, default=2)
+parser.add_argument("--qvg_quant_block_size", type=int, default=64)
+parser.add_argument("--qvg_num_prq_stages", type=int, default=1)
 args = parser.parse_args()
 
 # Initialize distributed inference
@@ -122,7 +136,37 @@ else:
 pipeline.generator.to(device=gpu)
 pipeline.vae.to(device=gpu)
 
-method_name, quantizer = parse_method(args.method, block_size=args.block_size)
+qvg_enabled = args.method.startswith("QVG_")
+if qvg_enabled:
+    if isinstance(pipeline, CausalDiffusionInferencePipeline):
+        raise NotImplementedError(
+            "QVG backend is not yet validated for "
+            "CausalDiffusionInferencePipeline"
+        )
+    method_name = args.method
+    quantizer = None
+    qvg_config = QVGConfig.from_method(
+        method_name,
+        num_k_centroids=args.qvg_num_k_centroids,
+        num_v_centroids=args.qvg_num_v_centroids,
+        kmeans_max_iters=args.qvg_kmeans_max_iters,
+        quant_block_size=args.qvg_quant_block_size,
+        num_prq_stages=args.qvg_num_prq_stages,
+        quant_factor=args.qvg_quant_factor,
+        timing_enabled=args.profile_quant_timing,
+    )
+    attach_qvg_to_pipeline(
+        pipeline,
+        qvg_config,
+        num_output_frames=args.num_output_frames,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+else:
+    method_name, quantizer = parse_method(
+        args.method, block_size=args.block_size
+    )
+
 if quantizer is not None:
     quantizer.set_timing_enabled(args.profile_quant_timing)
     attach_quantizer_to_pipeline(
@@ -199,20 +243,32 @@ def _write_metrics(
     block_size: int,
 ) -> None:
     torch.cuda.synchronize(device)
-    finalize_quantized_kv_cache(pipeline, quantizer)
+    is_qvg = method_name.startswith("QVG_")
+    if not is_qvg:
+        finalize_quantized_kv_cache(pipeline, quantizer)
     elapsed = time.perf_counter() - start_time
     peak_vram_bytes = _distributed_max_memory(device)
-    bf16_kv_bytes, compressed_kv_bytes = resident_kv_memory_bytes(
-        pipeline, quantizer
-    )
-    stats = getattr(quantizer, "stats", None)
+    if is_qvg:
+        bf16_kv_bytes, compressed_kv_bytes = qvg_resident_memory_bytes(
+            pipeline
+        )
+        stats = pipeline.qvg_stats
+    else:
+        bf16_kv_bytes, compressed_kv_bytes = resident_kv_memory_bytes(
+            pipeline, quantizer
+        )
+        stats = getattr(quantizer, "stats", None)
     if stats is not None and hasattr(stats, "resolve_timing"):
         stats.resolve_timing(synchronize=False)
     report = {
         "model": "causal_forcing",
         "method": method_name,
-        "block_size": int(block_size),
-        "bits": None if method_name == "BF16" else int(quantizer.bits),
+        "block_size": None if is_qvg else int(block_size),
+        "bits": (
+            int(pipeline.qvg_config.bits)
+            if is_qvg
+            else None if method_name == "BF16" else int(quantizer.bits)
+        ),
         "end_to_end_generation_time_s": float(elapsed),
         "wall_clock_runtime_s": float(elapsed),
         "peak_vram_bytes": peak_vram_bytes,
@@ -237,7 +293,37 @@ def _write_metrics(
         "dequantize_calls": 0 if stats is None else int(stats.dequantize_calls),
         "prompt_idx": int(prompt_idx),
     }
-    if quantizer is not None:
+    if is_qvg:
+        qvg_memory = qvg_memory_breakdown(pipeline)
+        report.update(
+            {
+                "resident_bf16_kv_bytes": int(
+                    qvg_memory.physical_bf16_bytes
+                ),
+                "resident_compressed_kv_bytes": int(
+                    qvg_memory.physical_compressed_bytes
+                ),
+                "active_bf16_kv_bytes": int(qvg_memory.physical_bf16_bytes),
+                "active_compressed_kv_bytes": int(
+                    qvg_memory.physical_compressed_bytes
+                ),
+                "resident_total_kv_bytes": int(qvg_memory.physical_bytes),
+                "uncompressed_reference_kv_bytes": int(
+                    qvg_memory.bf16_equivalent_bytes
+                ),
+                "effective_kv_bits_per_value": float(
+                    qvg_memory.physical_bytes
+                    * 8
+                    / max(qvg_memory.logical_values, 1)
+                ),
+                "compression_ratio": float(
+                    qvg_memory.bf16_equivalent_bytes
+                    / max(qvg_memory.physical_bytes, 1)
+                ),
+            }
+        )
+        report.update(qvg_metrics(pipeline))
+    if quantizer is not None or is_qvg:
         if stats.quantize_calls <= 0:
             raise RuntimeError("KV quantization was never triggered.")
         if stats.dequantize_calls <= 0:
@@ -298,7 +384,9 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
             [1, args.num_output_frames, 16, 60, 104], device=device, dtype=torch.bfloat16
         )
 
-    if quantizer is not None:
+    if qvg_enabled:
+        reset_qvg_cache(pipeline)
+    elif quantizer is not None:
         reset_quantized_kv_cache(pipeline)
         quantizer.reset_stats()
     torch.cuda.reset_peak_memory_stats(device)

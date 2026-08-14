@@ -2,6 +2,12 @@ from typing import List, Optional
 import time
 import torch
 
+from qvg_runtime import (
+    ensure_qvg_capacity,
+    maybe_quantize_qvg_history,
+    reset_qvg_cache,
+)
+
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 
 from demo_utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller, move_model_to_device_with_memory_preservation
@@ -104,6 +110,10 @@ class CausalInferencePipeline(torch.nn.Module):
         num_input_frames = initial_latent.shape[1] if initial_latent is not None else 0
         num_output_frames = num_frames + num_input_frames  # add the initial latent frames
 
+        # QVG caches are lazily allocated by chunk. Grow their slot capacity
+        # after the prompt's context length is known, before any cache write.
+        ensure_qvg_capacity(self, num_output_frames)
+
         # Optional: start generation timer (excludes VAE decode). Only runs
         # when the caller explicitly opts in.
         if report_timing:
@@ -154,13 +164,16 @@ class CausalInferencePipeline(torch.nn.Module):
             for block_index in range(self.num_transformer_blocks):
                 self.crossattn_cache[block_index]["is_init"] = False
             # reset kv cache
-            for block_index in range(len(self.kv_cache1)):
-                self.kv_cache1[block_index]["global_end_index"] = torch.tensor(
-                    [0], dtype=torch.long, device=noise.device)
-                self.kv_cache1[block_index]["local_end_index"] = torch.tensor(
-                    [0], dtype=torch.long, device=noise.device)
-                if "quantizer" in self.kv_cache1[block_index]:
-                    self.kv_cache1[block_index]["quant_state"] = None
+            if getattr(self, "qvg_enabled", False):
+                reset_qvg_cache(self)
+            else:
+                for block_index in range(len(self.kv_cache1)):
+                    self.kv_cache1[block_index]["global_end_index"] = torch.tensor(
+                        [0], dtype=torch.long, device=noise.device)
+                    self.kv_cache1[block_index]["local_end_index"] = torch.tensor(
+                        [0], dtype=torch.long, device=noise.device)
+                    if "quantizer" in self.kv_cache1[block_index]:
+                        self.kv_cache1[block_index]["quant_state"] = None
 
         # Step 2: Cache context feature
         current_start_frame = 0
@@ -209,6 +222,15 @@ class CausalInferencePipeline(torch.nn.Module):
         if self.independent_first_frame and initial_latent is None:
             all_num_frames = [1] + all_num_frames
         for block_index, current_num_frames in enumerate(tqdm.tqdm(all_num_frames)):
+            # QVG compresses finalized history at generation-block boundaries.
+            # The block about to be denoised remains mutable BF16.
+            maybe_quantize_qvg_history(
+                self,
+                block_index,
+                all_num_frames,
+                generation_start_frame=num_input_frames,
+            )
+
             # Optional: time the first block (TTFC). Excludes the KV-cache
             # refresh pass that follows the main denoising.
             if report_timing and block_index == 0:
