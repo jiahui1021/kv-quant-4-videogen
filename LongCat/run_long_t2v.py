@@ -219,7 +219,11 @@ def generate(args):
     prompt = args.prompt
     negative_prompt = args.negative_prompt
     prompt_idx = args.prompt_idx
-    prompt = load_prompt_or_image(prompt_source, prompt_idx, prompt)
+    loaded = load_prompt_or_image(prompt_source, prompt_idx, prompt)
+    if isinstance(loaded, tuple):
+        prompt, image_path = loaded
+    else:
+        prompt = loaded
 
     seed = args.seed
 
