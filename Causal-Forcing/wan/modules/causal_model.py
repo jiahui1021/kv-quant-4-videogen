@@ -173,7 +173,7 @@ class CausalWanSelfAttention(nn.Module):
                 }
             )
 
-        previous_global_end = int(kv_cache["global_end_index"].item())
+        previous_global_end = int(int(kv_cache["global_end_index"]))
         previous_tokens = int(state.get("num_tokens", 0))
         num_new_tokens = int(roped_key.shape[1])
 
@@ -482,26 +482,26 @@ class CausalWanSelfAttention(nn.Module):
                 # If we are using local attention and the current KV cache size is larger than the local attention size, we need to truncate the KV cache
                 kv_cache_size = cache_k.shape[1]
                 num_new_tokens = roped_query.shape[1]
-                if self.local_attn_size != -1 and (current_end > kv_cache["global_end_index"].item()) and (
-                        num_new_tokens + kv_cache["local_end_index"].item() > kv_cache_size):
+                if self.local_attn_size != -1 and (current_end > int(kv_cache["global_end_index"])) and (
+                        num_new_tokens + int(kv_cache["local_end_index"]) > kv_cache_size):
                     # Calculate the number of new tokens added in this step
                     # Shift existing cache content left to discard oldest tokens
                     # Clone the source slice to avoid overlapping memory error
-                    num_evicted_tokens = num_new_tokens + kv_cache["local_end_index"].item() - kv_cache_size
-                    num_rolled_tokens = kv_cache["local_end_index"].item() - num_evicted_tokens - sink_tokens
+                    num_evicted_tokens = num_new_tokens + int(kv_cache["local_end_index"]) - kv_cache_size
+                    num_rolled_tokens = int(kv_cache["local_end_index"]) - num_evicted_tokens - sink_tokens
                     cache_k[:, sink_tokens:sink_tokens + num_rolled_tokens] = \
                         cache_k[:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
                     cache_v[:, sink_tokens:sink_tokens + num_rolled_tokens] = \
                         cache_v[:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
                     # Insert the new keys/values at the end
-                    local_end_index = kv_cache["local_end_index"].item() + current_end - \
-                        kv_cache["global_end_index"].item() - num_evicted_tokens
+                    local_end_index = int(kv_cache["local_end_index"]) + current_end - \
+                        int(kv_cache["global_end_index"]) - num_evicted_tokens
                     local_start_index = local_end_index - num_new_tokens
                     cache_k[:, local_start_index:local_end_index] = roped_key
                     cache_v[:, local_start_index:local_end_index] = v
                 else:
                     # Assign new keys/values directly up to current_end
-                    local_end_index = kv_cache["local_end_index"].item() + current_end - kv_cache["global_end_index"].item()
+                    local_end_index = int(kv_cache["local_end_index"]) + current_end - int(kv_cache["global_end_index"])
                     local_start_index = local_end_index - num_new_tokens
                     cache_k[:, local_start_index:local_end_index] = roped_key
                     cache_v[:, local_start_index:local_end_index] = v
@@ -524,8 +524,8 @@ class CausalWanSelfAttention(nn.Module):
                     # state; the shared baselines use the branch above.
                     kv_cache["k"] = cache_k.new_empty(0)
                     kv_cache["v"] = cache_v.new_empty(0)
-            kv_cache["global_end_index"].fill_(current_end)
-            kv_cache["local_end_index"].fill_(local_end_index)
+            kv_cache["global_end_index"] = current_end
+            kv_cache["local_end_index"] = local_end_index
 
         # output
         x = x.flatten(2)
