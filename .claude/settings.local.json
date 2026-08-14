@@ -1,0 +1,31 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//mnt/cpfs/epic-user/hujiahui-20260612/Tempokv/**)",
+      "Bash(nohup env PYTHON_BIN=/mnt/cpfs/epic-user/hujiahui-20260612/miniconda3/envs/qvg/bin/python /mnt/cpfs/epic-user/hujiahui-20260612/miniconda3/envs/qvg/bin/python scripts/common/fit_params.py data/self-forcing/trace/clean_trace.npz --config configs/int4.json --output-dir data/self-forcing/params/kh3-vh1-int4 --iterations 2 --temporal-ridge 0.1 --cross-ridge 0.1 --max-gain 1.0 --device auto --stride 1560 --coordinate-system pre_rope_normalized --v-history-mode diagonal)",
+      "Bash(echo \"PID=$!\")",
+      "Bash(cd /mnt/cpfs/epic-user/hujiahui-20260612/Tempokv)",
+      "Bash(echo \"=== 清理失败的拟合残留 ===\")",
+      "Bash(nohup env PYTHON_BIN=/mnt/cpfs/epic-user/hujiahui-20260612/miniconda3/envs/qvg/bin/python CONFIG=configs/int4.json KH=3 VH=1 TRACE_FILE=data/self-forcing/trace_legacy/clean_trace.npz bash scripts/Self-Forcing/fit_params.sh)",
+      "Bash(nohup env PYTHON_BIN=/mnt/cpfs/epic-user/hujiahui-20260612/miniconda3/envs/qvg/bin/python CONFIG=configs/int2.json CHECKPOINT=/mnt/cpfs/epic-user/hujiahui-20260612/checkpoints/self_forcing_dmd.pt WAN_MODEL_DIR=/mnt/cpfs/epic-user/hujiahui-20260612/models--Wan-AI--Wan2.1-T2V-1.3B PROMPTS=assets/moviegen128.txt FRAMES=717 START_INDEX=0 END_INDEX=1 bash scripts/Self-Forcing/run_tempokv.sh)",
+      "Bash(echo \"生成 PID=$!\")",
+      "Bash(nohup env CONFIG=configs/int4.json KH=3 VH=1 LABEL=legacy-kh3-vh1-int4 bash scripts/run_legacy_flow_timed.sh)",
+      "Bash(echo \"Int4 PID=$!\")",
+      "Bash(nohup bash -c ' *)",
+      "Bash(echo \"=== 重跑 fit ===\")",
+      "Bash(PYTHON_BIN=/mnt/cpfs/epic-user/hujiahui-20260612/miniconda3/envs/qvg/bin/python CONFIG=configs/int4.json KH=3 VH=1 TRACE_FILE=data/self-forcing/trace_legacy/clean_trace.npz bash scripts/Self-Forcing/fit_params.sh)",
+      "Bash(nohup env PYTHON_BIN=/mnt/cpfs/epic-user/hujiahui-20260612/miniconda3/envs/qvg/bin/python CONFIG=configs/int4.json KH=3 VH=1 CHECKPOINT=/mnt/cpfs/epic-user/hujiahui-20260612/checkpoints/self_forcing_dmd.pt WAN_MODEL_DIR=/mnt/cpfs/epic-user/hujiahui-20260612/models--Wan-AI--Wan2.1-T2V-1.3B PROMPTS=assets/moviegen128.txt FRAMES=717 START_INDEX=0 END_INDEX=1 bash scripts/Self-Forcing/run_tempokv.sh)",
+      "Bash(echo \"int4 fit PID=$!\")",
+      "Bash(nohup env PYTHON_BIN=/mnt/cpfs/epic-user/hujiahui-20260612/miniconda3/envs/qvg/bin/python /mnt/cpfs/epic-user/hujiahui-20260612/miniconda3/envs/qvg/bin/python scripts/common/fit_params.py data/self-forcing/trace_legacy/clean_trace.npz --config configs/int4.json --output-dir data/self-forcing/params/legacy-kh3-vh1-int4-r32 --iterations 2 --temporal-ridge 1.0 --cross-ridge 0.1 --v-history-ridge 0.0 --v-history-mode diagonal --max-gain 1.0 --device auto --stride 1560 --coordinate-system pre_rope_normalized --k-history-length 3 --v-history-length 1 --cross-rank 32)",
+      "Bash(nohup env PYTHON_BIN=/mnt/cpfs/epic-user/hujiahui-20260612/miniconda3/envs/qvg/bin/python CONFIG=configs/int4_r32.json KH=3 VH=1 CHECKPOINT=/mnt/cpfs/epic-user/hujiahui-20260612/checkpoints/self_forcing_dmd.pt WAN_MODEL_DIR=/mnt/cpfs/epic-user/hujiahui-20260612/models--Wan-AI--Wan2.1-T2V-1.3B PROMPTS=assets/moviegen128.txt FRAMES=717 START_INDEX=0 END_INDEX=1 bash scripts/Self-Forcing/run_tempokv.sh)",
+      "Bash(nohup env PYTHON_BIN=/mnt/cpfs/epic-user/hujiahui-20260612/miniconda3/envs/qvg/bin/python CONFIG=configs/int4_r32.json KH=3 VH=1 PARAM_DIR=data/self-forcing/params/legacy-kh3-vh1-int4-r32 CHECKPOINT=/mnt/cpfs/epic-user/hujiahui-20260612/checkpoints/self_forcing_dmd.pt WAN_MODEL_DIR=/mnt/cpfs/epic-user/hujiahui-20260612/models--Wan-AI--Wan2.1-T2V-1.3B PROMPTS=assets/moviegen128.txt FRAMES=717 START_INDEX=0 END_INDEX=1 bash scripts/Self-Forcing/run_tempokv.sh)",
+      "Bash(nohup env PYTHON_BIN=/mnt/cpfs/epic-user/hujiahui-20260612/miniconda3/envs/qvg/bin/python CONFIG=configs/int2.json KH=2 VH=1 TRACE_FILE=data/self-forcing/trace_legacy/clean_trace.npz bash scripts/Self-Forcing/fit_params.sh)",
+      "Bash(echo \"int2 fit PID=$!\")",
+      "Bash(env PYTHON_BIN=/mnt/cpfs/epic-user/hujiahui-20260612/miniconda3/envs/qvg/bin/python CONFIG=configs/int4.json KH=3 VH=1 TEMPOKV_PERSISTENT_UNITS_PER_LAUNCH=16 CHECKPOINT=/mnt/cpfs/epic-user/hujiahui-20260612/checkpoints/self_forcing_dmd.pt WAN_MODEL_DIR=/mnt/cpfs/epic-user/hujiahui-20260612/models--Wan-AI--Wan2.1-T2V-1.3B PROMPTS=assets/moviegen128.txt FRAMES=717 START_INDEX=0 END_INDEX=1 bash scripts/Self-Forcing/run_tempokv.sh)",
+      "Bash(env PYTHON_BIN=/mnt/cpfs/epic-user/hujiahui-20260612/miniconda3/envs/qvg/bin/python CONFIG=configs/int2.json KH=2 VH=1 TEMPOKV_PERSISTENT_UNITS_PER_LAUNCH=16 CHECKPOINT=/mnt/cpfs/epic-user/hujiahui-20260612/checkpoints/self_forcing_dmd.pt WAN_MODEL_DIR=/mnt/cpfs/epic-user/hujiahui-20260612/models--Wan-AI--Wan2.1-T2V-1.3B PROMPTS=assets/moviegen128.txt FRAMES=717 START_INDEX=0 END_INDEX=1 bash scripts/Self-Forcing/run_tempokv.sh)",
+      "Bash(env PYTHON_BIN=/mnt/cpfs/epic-user/hujiahui-20260612/miniconda3/envs/qvg/bin/python CONFIG=/tmp/int2_kh3.json PARAM_NAME=legacy-kh3-vh1-int4-as-int2 PARAM_DIR=data/self-forcing/params/legacy-kh3-vh1-int4-as-int2 KH=3 VH=1 TEMPOKV_PERSISTENT_UNITS_PER_LAUNCH=16 CHECKPOINT=/mnt/cpfs/epic-user/hujiahui-20260612/checkpoints/self_forcing_dmd.pt WAN_MODEL_DIR=/mnt/cpfs/epic-user/hujiahui-20260612/models--Wan-AI--Wan2.1-T2V-1.3B PROMPTS=assets/moviegen128.txt FRAMES=717 START_INDEX=0 END_INDEX=1 OUTPUT_DIR=results/self_forcing/legacy-kh3-vh1-int4asint2 bash scripts/Self-Forcing/run_tempokv.sh)",
+      "Bash(env PYTHON_BIN=/mnt/cpfs/epic-user/hujiahui-20260612/miniconda3/envs/qvg/bin/python CONFIG=/tmp/int4_strict_old_structure.json PARAM_NAME=legacy-kh3-vh1-int4 PARAM_DIR=data/self-forcing/params/legacy-kh3-vh1-int4 KH=3 VH=1 TEMPOKV_PERSISTENT_UNITS_PER_LAUNCH=16 CHECKPOINT=/mnt/cpfs/epic-user/hujiahui-20260612/checkpoints/self_forcing_dmd.pt WAN_MODEL_DIR=/mnt/cpfs/epic-user/hujiahui-20260612/models--Wan-AI--Wan2.1-T2V-1.3B PROMPTS=assets/moviegen128.txt FRAMES=717 START_INDEX=0 END_INDEX=1 OUTPUT_DIR=results/self_forcing/dedicated_gpu1_kh3_vh1_test_int4 bash scripts/Self-Forcing/run_tempokv.sh)",
+      "Bash(git stash *)"
+    ]
+  }
+}

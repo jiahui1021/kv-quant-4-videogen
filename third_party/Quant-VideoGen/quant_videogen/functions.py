@@ -264,7 +264,7 @@ def triton_prq_quantize_tensor(
     num_clusters: int,
     block_size: int,
     max_iters: int = 100,
-    scale_precision: torch.dtype = torch.float8_e4m3fn,
+    scale_precision: torch.dtype = torch.bfloat16,
     use_percentile_clipping: bool = False,
     percentile: float = 99.0,
     quantize_fn=None,
