@@ -146,39 +146,19 @@ python Causal-Forcing/inference.py \
   --use_ema
 ```
 
-For the official QVG baselines, install the additional dependencies in
-`Causal-Forcing/requirements-qvg.txt` and run:
+For QVG, install the dependencies in `Causal-Forcing/requirements-qvg.txt`
+and run the launcher:
 
 ```bash
-python Causal-Forcing/inference.py \
-  --config_path Causal-Forcing/configs/causal_forcing_dmd_framewise.yaml \
-  --checkpoint_path /path/to/causal_forcing.pt \
-  --data_path Causal-Forcing/prompts/demos.txt \
-  --output_folder results/causal_forcing/QVG_INT2 \
-  --num_output_frames 21 \
-  --method QVG_INT2 \
-  --qvg_quant_factor 8 \
-  --qvg_num_k_centroids 256 \
-  --qvg_num_v_centroids 256 \
-  --qvg_kmeans_max_iters 2 \
-  --qvg_quant_block_size 64 \
-  --qvg_num_prq_stages 1 \
-  --use_ema
+CHECKPOINT_PATH=/path/to/causal_forcing.pt \
+DATA_PATH=Causal-Forcing/prompts/demos.txt \
+bash Causal-Forcing/run_qvg.sh
 ```
 
-QVG stores normalized pre-RoPE K and raw V in the pinned official
-`Quant-VideoGen` `ChunkedKVCache`. It compresses eight finalized generation
-chunks at the next block boundary; the active denoising block stays BF16 and
-previous compressed spans are immutable. The first migration is validated for
-the few-step `CausalInferencePipeline` with `sink_size=0` and an attention
-window large enough to retain the first eight generation chunks. Both
-`QVG_INT2` and `QVG_INT4` use the same official cache lifecycle; select the
-bit width with `--method`. The diffusion pipeline and QVG-Pro are not exposed
-as validated methods.
+The default is QVG_INT2; use `METHOD=QVG_INT4` for INT4. The launcher uses the
+chunkwise 51-frame configuration and currently supports T2V only.
 
 For text-to-video, use a prompt file such as `Causal-Forcing/prompts/demos.txt`. For image-to-video, add `--i2v` and pass an image-prompt dataset supported by the original Causal-Forcing loader.
-
-Frame-wise and chunk-wise configurations are selected with `--config_path`; the quantization arguments remain the same.
 
 ### 2. Run the complete Causal-Forcing matrix
 
@@ -187,7 +167,8 @@ CONFIG_PATH=Causal-Forcing/configs/causal_forcing_dmd_framewise.yaml \
 CHECKPOINT_PATH=/path/to/causal_forcing.pt \
 DATA_PATH=Causal-Forcing/prompts/demos.txt \
 OUTPUT_ROOT=results/causal_forcing \
-NUM_OUTPUT_FRAMES=21 \
+NUM_OUTPUT_FRAMES=51 \
+LOCAL_ATTN_SIZE=51 \
 bash Causal-Forcing/run_baseline_matrix.sh
 ```
 
@@ -233,7 +214,8 @@ Causal-Forcing generic baselines report resident cache capacity. QVG reports
 physical BF16 chunks, centroids, cluster IDs, packed residuals, scales and
 zero-points separately, together with `resident_total_kv_bytes`,
 `uncompressed_reference_kv_bytes`, effective bits/value, QVG configuration and
-the pinned upstream commit.
+the pinned upstream commit. QVG resident bytes include both packed tensors and
+the BF16 tail.
 
 ## Recommended validation order
 

@@ -6,7 +6,8 @@ set -euo pipefail
 : "${DATA_PATH:?Set DATA_PATH to the prompt file}"
 
 OUTPUT_ROOT="${OUTPUT_ROOT:-results/causal_forcing}"
-NUM_OUTPUT_FRAMES="${NUM_OUTPUT_FRAMES:-21}"
+NUM_OUTPUT_FRAMES="${NUM_OUTPUT_FRAMES:-51}"
+LOCAL_ATTN_SIZE="${LOCAL_ATTN_SIZE:-51}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 
 METHODS=(
@@ -42,6 +43,7 @@ for method in "${METHODS[@]}"; do
     --data_path "${DATA_PATH}" \
     --output_folder "${OUTPUT_ROOT}/${method}" \
     --num_output_frames "${NUM_OUTPUT_FRAMES}" \
+    --local_attn_size "${LOCAL_ATTN_SIZE}" \
     "${method_args[@]}" \
     --use_ema
 done

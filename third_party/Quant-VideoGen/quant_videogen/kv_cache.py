@@ -7,7 +7,7 @@ from enum import IntEnum
 from typing import Optional
 import torch
 
-from .uncompress import uncompress_kv_cache
+from .uncompress import uncompress_single_kv_cache
 
 class ChunkState(IntEnum):
     EMPTY = 0
@@ -135,7 +135,10 @@ class ChunkedKVCache:
             e = s + self.frame_seq_length
 
             if self.chunk_state[ci] == ChunkState.QUANTIZED:
-                self._remove_overlapping_spans(ci, ci + 1)
+                raise RuntimeError(
+                    f"Cannot overwrite immutable quantized chunk {ci}; "
+                    "evict the complete span or reset the cache first"
+                )
 
             self._alloc_chunk(ci)
             if self.seq_dim == 2:  # BHSD
@@ -168,8 +171,11 @@ class ChunkedKVCache:
 
             elif state == ChunkState.QUANTIZED:
                 span = self._find_span(ci)
+                # Each cache owns one packed state (K or V).  Decompress only
+                # that state; invoking the pair API here would redo the same
+                # Triton work twice for every read.
                 # uncompress always returns BHSD [B, H, S, D]
-                dec, _ = uncompress_kv_cache(span["quant_data"], span["quant_data"])
+                dec = uncompress_single_kv_cache(span["quant_data"])
                 if self.layout == "BSHD":
                     dec = dec.permute(0, 2, 1, 3).contiguous()
 

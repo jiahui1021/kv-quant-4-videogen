@@ -45,30 +45,30 @@ def uncompress_kv_cache(
         (k_tensor, v_tensor) for this layer, ready for attention.
     """
 
-    if not isinstance(k_cache, dict) or not isinstance(v_cache, dict):
-        return k_cache, v_cache
+    return uncompress_single_kv_cache(k_cache), uncompress_single_kv_cache(v_cache)
 
-    # Unpack the kv cache and extract the info
-    quant_config = k_cache["info"]["quant_config"]
-    output_dtype = k_cache["info"]["output_dtype"]
-    
+
+def uncompress_single_kv_cache(cache: torch.Tensor | dict) -> torch.Tensor:
+    """Decompress one packed K *or* V state.
+
+    ``ChunkedKVCache`` owns K and V independently, so passing the same packed
+    object twice to the pair API would perform the same decompression twice.
+    This single-state entry point keeps that cache read path explicit and
+    avoids doubling the Triton work.
+    """
+    if not isinstance(cache, dict):
+        return cache
+
+    quant_config = cache["info"]["quant_config"]
+    output_dtype = cache["info"]["output_dtype"]
     quantize_type = get_quantize_type(quant_config.quant_type)
     num_bits = extract_num_bits(quant_config)
 
     if quantize_type in (QuantizeFunctions.TRITON_PRQ, QuantizeFunctions.TRITON_PRQ_CLIP):
-        k_tensor = triton_prq_dequantize_tensor(
-            k_cache,
+        return triton_prq_dequantize_tensor(
+            cache,
             quant_config.quant_block_size,
             num_bits,
             output_dtype=output_dtype,
         )
-        v_tensor = triton_prq_dequantize_tensor(
-            v_cache,
-            quant_config.quant_block_size,
-            num_bits,
-            output_dtype=output_dtype,
-        )
-    else:
-        pass
-
-    return k_tensor, v_tensor
+    raise ValueError(f"Unsupported QVG quantization type: {quant_config.quant_type}")

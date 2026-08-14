@@ -152,31 +152,15 @@ frame-wise 和 chunk-wise 模型通过 `--config_path` 选择，量化参数保�
 ### 2. QVG_INT2 / QVG_INT4
 
 安装 [`Causal-Forcing/requirements-qvg.txt`](Causal-Forcing/requirements-qvg.txt)
-中列出的 Triton 依赖后，可以运行官方 QVG INT2 或 INT4 baseline。示例使用 INT2；将
-`--method QVG_INT2` 改为 `--method QVG_INT4` 即可运行 INT4：
+中的依赖后，直接运行 launcher：
 
 ```bash
-python Causal-Forcing/inference.py \
-  --config_path Causal-Forcing/configs/causal_forcing_dmd_framewise.yaml \
-  --checkpoint_path /path/to/causal_forcing.pt \
-  --data_path Causal-Forcing/prompts/demos.txt \
-  --output_folder results/causal_forcing/QVG_INT2 \
-  --num_output_frames 21 \
-  --method QVG_INT2 \
-  --qvg_quant_factor 8 \
-  --qvg_num_k_centroids 256 \
-  --qvg_num_v_centroids 256 \
-  --qvg_kmeans_max_iters 2 \
-  --qvg_quant_block_size 64 \
-  --qvg_num_prq_stages 1 \
-  --use_ema
+CHECKPOINT_PATH=/path/to/causal_forcing.pt \
+DATA_PATH=Causal-Forcing/prompts/demos.txt \
+bash Causal-Forcing/run_qvg.sh
 ```
 
-QVG 缓存 normalized pre-RoPE K 和原始 V，每累计 8 个已完成的生成 chunk
-后，在下一个 block 开始前压缩。当前 denoising block 始终保留 BF16，已压缩
-span 不会重新量化。INT2 和 INT4 使用相同的官方 cache 生命周期，要求
-`sink_size=0` 且 attention window 足以保留最初 8 个 generation chunk。当前只验证
-few-step `CausalInferencePipeline`；diffusion pipeline 和 QVG-Pro 尚未作为验证通过的方法提供。
+默认运行 QVG_INT2；设置 `METHOD=QVG_INT4` 可运行 INT4。
 
 ### 3. 批量运行 Causal-Forcing baseline
 
@@ -185,7 +169,8 @@ CONFIG_PATH=Causal-Forcing/configs/causal_forcing_dmd_framewise.yaml \
 CHECKPOINT_PATH=/path/to/causal_forcing.pt \
 DATA_PATH=Causal-Forcing/prompts/demos.txt \
 OUTPUT_ROOT=results/causal_forcing \
-NUM_OUTPUT_FRAMES=21 \
+NUM_OUTPUT_FRAMES=51 \
+LOCAL_ATTN_SIZE=51 \
 bash Causal-Forcing/run_baseline_matrix.sh
 ```
 
@@ -230,7 +215,7 @@ Causal-Forcing 指标位置：
 Causal-Forcing 通用 baseline 按 resident cache capacity 统计；QVG 额外分别报告
 BF16 chunk、centroid、cluster ID、packed residual、scale 和 zero-point 的物理显存，
 并输出 `resident_total_kv_bytes`、`uncompressed_reference_kv_bytes`、effective bits/value、
-QVG 配置和固定 upstream commit。
+QVG 配置和固定 upstream commit；resident bytes 包含压缩数据和 BF16 尾部。
 
 ## 推荐验证顺序
 

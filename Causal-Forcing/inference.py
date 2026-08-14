@@ -49,7 +49,7 @@ parser.add_argument("--config_path", type=str, help="Path to the config file")
 parser.add_argument("--checkpoint_path", type=str, help="Path to the checkpoint folder")
 parser.add_argument("--data_path", type=str, help="Path to the dataset")
 parser.add_argument("--output_folder", type=str, help="Output folder")
-parser.add_argument("--num_output_frames", type=int, default=21, help="Number of overlap frames between sliding windows")
+parser.add_argument("--num_output_frames", type=int, default=51, help="Number of latent frames to generate")
 parser.add_argument("--use_ema", action="store_true", help="Whether to use EMA parameters")
 parser.add_argument("--seed", type=int, default=0, help="Random seed")
 parser.add_argument("--i2v", action="store_true", help="Whether to perform I2V (or T2V by default)")
@@ -79,6 +79,17 @@ parser.add_argument("--qvg_num_v_centroids", type=int, default=256)
 parser.add_argument("--qvg_kmeans_max_iters", type=int, default=2)
 parser.add_argument("--qvg_quant_block_size", type=int, default=64)
 parser.add_argument("--qvg_num_prq_stages", type=int, default=1)
+parser.add_argument(
+    "--qvg_disable_compression",
+    action="store_true",
+    help="Keep QVG cache entries in BF16 for cache/RoPE equivalence debugging",
+)
+parser.add_argument(
+    "--local_attn_size",
+    type=int,
+    default=None,
+    help="Override the causal model attention window in latent frames",
+)
 args = parser.parse_args()
 
 # Initialize distributed inference
@@ -104,6 +115,10 @@ torch.set_grad_enabled(False)
 config = OmegaConf.load(args.config_path)
 default_config = OmegaConf.load(str(CAUSAL_ROOT / "configs/default_config.yaml"))
 config = OmegaConf.merge(default_config, config)
+if args.local_attn_size is not None:
+    if not hasattr(config, "model_kwargs") or config.model_kwargs is None:
+        config.model_kwargs = OmegaConf.create({})
+    config.model_kwargs.local_attn_size = int(args.local_attn_size)
 
 # Initialize pipeline
 if hasattr(config, 'denoising_step_list'):
@@ -138,6 +153,10 @@ pipeline.vae.to(device=gpu)
 
 qvg_enabled = args.method.startswith("QVG_")
 if qvg_enabled:
+    if args.i2v:
+        raise NotImplementedError(
+            "QVG Causal-Forcing I2V path is not yet validated; use T2V first."
+        )
     if isinstance(pipeline, CausalDiffusionInferencePipeline):
         raise NotImplementedError(
             "QVG backend is not yet validated for "
@@ -145,6 +164,10 @@ if qvg_enabled:
         )
     method_name = args.method
     quantizer = None
+    qvg_disable_compression = args.qvg_disable_compression or (
+        os.environ.get("QVG_BF16_DEBUG", "").lower()
+        in {"1", "true", "yes", "on"}
+    )
     qvg_config = QVGConfig.from_method(
         method_name,
         num_k_centroids=args.qvg_num_k_centroids,
@@ -154,6 +177,7 @@ if qvg_enabled:
         num_prq_stages=args.qvg_num_prq_stages,
         quant_factor=args.qvg_quant_factor,
         timing_enabled=args.profile_quant_timing,
+        compression_enabled=not qvg_disable_compression,
     )
     attach_qvg_to_pipeline(
         pipeline,
@@ -301,12 +325,16 @@ def _write_metrics(
                     qvg_memory.physical_bf16_bytes
                 ),
                 "resident_compressed_kv_bytes": int(
-                    qvg_memory.physical_compressed_bytes
+                    qvg_memory.physical_bytes
                 ),
                 "active_bf16_kv_bytes": int(qvg_memory.physical_bf16_bytes),
                 "active_compressed_kv_bytes": int(
+                    qvg_memory.physical_bytes
+                ),
+                "qvg_packed_bytes": int(
                     qvg_memory.physical_compressed_bytes
                 ),
+                "qvg_bf16_tail_bytes": int(qvg_memory.physical_bf16_bytes),
                 "resident_total_kv_bytes": int(qvg_memory.physical_bytes),
                 "uncompressed_reference_kv_bytes": int(
                     qvg_memory.bf16_equivalent_bytes
@@ -323,7 +351,10 @@ def _write_metrics(
             }
         )
         report.update(qvg_metrics(pipeline))
-    if quantizer is not None or is_qvg:
+    qvg_compression_enabled = (
+        is_qvg and bool(pipeline.qvg_config.compression_enabled)
+    )
+    if quantizer is not None or qvg_compression_enabled:
         if stats.quantize_calls <= 0:
             raise RuntimeError("KV quantization was never triggered.")
         if stats.dequantize_calls <= 0:

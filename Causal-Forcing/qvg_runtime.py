@@ -30,6 +30,10 @@ class QVGConfig:
     quant_factor: int = 8
     asymmetric: bool = False
     timing_enabled: bool = False
+    # Debug-only switch used to validate the cache/RoPE integration before
+    # enabling the real Triton codec.  The cache remains a QVG cache, but no
+    # finalized span is compressed while this is false.
+    compression_enabled: bool = True
 
     def __post_init__(self) -> None:
         expected_type = f"triton-nstages-kmeans-int{self.bits}"
@@ -152,6 +156,19 @@ def _load_qvg():
             "including Triton. Install them in the Causal-Forcing environment."
         ) from exc
     return ChunkedKVCache, compress_kv_cache, get_quantize_fn
+
+
+def _qvg_debug_enabled() -> bool:
+    # Read the environment at the point of use so a launcher can enable debug
+    # logging without importing this module again.
+    import os
+
+    return os.environ.get("QVG_DEBUG", "").lower() in {"1", "true", "yes", "on"}
+
+
+def _qvg_debug(message: str) -> None:
+    if _qvg_debug_enabled():
+        print(f"[QVG_DEBUG] {message}", flush=True)
 
 
 def _cache_lists(pipeline) -> list[list[dict]]:
@@ -291,6 +308,13 @@ def attach_qvg_to_pipeline(
     pipeline.qvg_stats = stats
     pipeline.qvg_max_num_chunks = max_num_chunks
     pipeline.qvg_scheduled_spans = set()
+    pipeline.qvg_compression_enabled = bool(config.compression_enabled)
+    _qvg_debug(
+        "attached "
+        f"INT{config.bits}: capacity={max_num_chunks} frames, "
+        f"frame_seq_length={pipeline.frame_seq_length}, "
+        f"compression_enabled={config.compression_enabled}"
+    )
 
 
 def reset_qvg_cache(pipeline, reset_stats: bool = True) -> None:
@@ -309,6 +333,7 @@ def reset_qvg_cache(pipeline, reset_stats: bool = True) -> None:
         stats.reset()
     if hasattr(pipeline, "qvg_scheduled_spans"):
         pipeline.qvg_scheduled_spans.clear()
+    _qvg_debug("cache reset")
 
 
 def qvg_span_for_block(
@@ -374,6 +399,8 @@ def maybe_quantize_qvg_history(
     if not getattr(pipeline, "qvg_enabled", False):
         return False
     config = pipeline.qvg_config
+    if not bool(getattr(config, "compression_enabled", True)):
+        return False
     span = qvg_span_for_block(
         block_index,
         all_num_frames,
@@ -391,6 +418,10 @@ def maybe_quantize_qvg_history(
         return False
     quantize_qvg_span(pipeline, span[0], span[1])
     scheduled.add(span)
+    _qvg_debug(
+        f"quantized span tokens=[{span[0]},{span[1]}) "
+        f"at generation block {block_index}"
+    )
     return True
 
 
@@ -425,21 +456,34 @@ def quantize_qvg_span(pipeline, start_token: int, end_token: int) -> None:
         raise ValueError("QVG span must be non-empty")
     _, compress_kv_cache, get_quantize_fn = _load_qvg()
     config: QVGConfig = pipeline.qvg_config
+    if not bool(getattr(config, "compression_enabled", True)):
+        raise RuntimeError("QVG compression is disabled in BF16 debug mode")
     stats: QVGStats = pipeline.qvg_stats
     quantize_fn = get_quantize_fn(config.quant_type, config)
     cache_lists = _cache_lists(pipeline)
     if not cache_lists:
         raise RuntimeError("No QVG caches are attached")
 
+    # Preflight every layer before modifying any cache.  This prevents a
+    # failed compressor on a later layer from leaving a partially quantized
+    # span that cannot be retried safely.
+    for cache_list in cache_lists:
+        for layer_idx, layer in enumerate(cache_list):
+            if _range_is_already_quantized(layer["k"], start_token, end_token):
+                raise RuntimeError(
+                    f"QVG span [{start_token}, {end_token}) overlaps an "
+                    f"immutable K span in layer {layer_idx}"
+                )
+            if _range_is_already_quantized(layer["v"], start_token, end_token):
+                raise RuntimeError(
+                    f"QVG span [{start_token}, {end_token}) overlaps an "
+                    f"immutable V span in layer {layer_idx}"
+                )
+
     for cache_list in cache_lists:
         for layer_idx, layer in enumerate(cache_list):
             k_cache = layer["k"]
             v_cache = layer["v"]
-            if _range_is_already_quantized(k_cache, start_token, end_token):
-                raise RuntimeError(
-                    f"QVG span [{start_token}, {end_token}) overlaps an "
-                    f"immutable span in layer {layer_idx}"
-                )
 
             k = k_cache.read(start_token, end_token)
             v = v_cache.read(start_token, end_token)
@@ -484,6 +528,18 @@ def quantize_qvg_span(pipeline, start_token: int, end_token: int) -> None:
     stats.quantized_chunks += (end_token - start_token) // int(
         pipeline.frame_seq_length
     )
+    _qvg_debug(
+        f"stored span tokens=[{start_token},{end_token}), "
+        f"frame_chunks={stats.quantized_chunks}"
+    )
+    if _qvg_debug_enabled():
+        memory = qvg_memory_breakdown(pipeline)
+        _qvg_debug(
+            "memory "
+            f"bf16_tail={memory.physical_bf16_bytes} bytes, "
+            f"packed={memory.physical_compressed_bytes} bytes, "
+            f"total={memory.physical_bytes} bytes"
+        )
 
 
 def _range_contains_quantized(cache, start_token: int, end_token: int) -> bool:
@@ -614,13 +670,27 @@ def qvg_metrics(pipeline) -> dict[str, Any]:
         "qvg_kmeans_max_iters": int(config.kmeans_max_iters),
         "qvg_quant_block_size": int(config.quant_block_size),
         "qvg_num_prq_stages": int(config.num_prq_stages),
+        "qvg_compression_enabled": bool(
+            getattr(config, "compression_enabled", True)
+        ),
+        # These timers cover the official codec calls only; cache reads,
+        # layout conversion, storage and BF16 release are outside this scope.
+        "qvg_codec_quantize_time_s": float(stats.quantize_time_s),
+        "qvg_codec_dequantize_time_s": float(stats.dequantize_time_s),
         "qvg_quantized_spans": int(stats.quantized_spans),
-        "qvg_quantized_chunks": int(quantized_chunks),
+        # This is the cumulative number of frame chunks compressed during the
+        # run.  ``quantized_chunks`` below is the currently resident count in
+        # one representative cache and is intentionally reported separately.
+        "qvg_quantized_chunks": int(stats.quantized_chunks),
+        "qvg_resident_quantized_chunks": int(quantized_chunks),
         "qvg_bf16_chunks": int(bf16_chunks),
         "qvg_physical_bf16_bytes": int(memory.physical_bf16_bytes),
         "qvg_physical_compressed_bytes": int(
             memory.physical_compressed_bytes
         ),
+        "qvg_packed_bytes": int(memory.physical_compressed_bytes),
+        "qvg_bf16_tail_bytes": int(memory.physical_bf16_bytes),
+        "qvg_physical_bytes": int(memory.physical_bytes),
         "qvg_resident_total_kv_bytes": int(memory.physical_bytes),
         "qvg_uncompressed_reference_kv_bytes": int(
             memory.bf16_equivalent_bytes

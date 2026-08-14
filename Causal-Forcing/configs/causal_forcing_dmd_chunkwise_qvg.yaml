@@ -1,0 +1,38 @@
+# Causal-Forcing chunkwise workload for QVG.
+# 17 blocks (51 latent frames) create spans at blocks 8 and 16.
+generator_ckpt: checkpoints/chunkwise/causal_ode.pt
+generator_fsdp_wrap_strategy: size
+real_score_fsdp_wrap_strategy: size
+fake_score_fsdp_wrap_strategy: size
+real_name: Wan2.1-T2V-14B
+text_encoder_fsdp_wrap_strategy: size
+denoising_step_list:
+- 1000
+- 750
+- 500
+- 250
+warp_denoising_step: true
+ts_schedule: false
+num_train_timestep: 1000
+timestep_shift: 5.0
+guidance_scale: 3.0
+denoising_loss_type: flow
+mixed_precision: true
+seed: 0
+sharding_strategy: hybrid_full
+batch_size: 1
+negative_prompt: ''
+image_or_video_shape:
+- 1
+- 51
+- 16
+- 60
+- 104
+distribution_loss: dmd
+trainer: score_distillation
+gradient_checkpointing: true
+num_frame_per_block: 3
+load_raw_video: false
+model_kwargs:
+  timestep_shift: 5.0
+  local_attn_size: 51

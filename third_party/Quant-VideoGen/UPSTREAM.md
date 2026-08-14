@@ -5,7 +5,10 @@
 - purpose: official QVG baseline for Causal-Forcing
 - copied on: 2026-08-14
 - copied files: `quant_videogen/` (26 source files)
-- local modifications: none
+- local modifications: `ChunkedKVCache` uses a single-state decompressor for
+  K/V reads and rejects writes into immutable quantized chunks; the adapter
+  records the rationale in its debug tests.
 
-The `quant_videogen/` directory is copied verbatim from the commit above.
-Causal-Forcing-specific integration lives outside this directory.
+The directory is copied from the commit above, with the two small cache
+lifecycle fixes documented above. Causal-Forcing-specific integration lives
+outside this directory.
