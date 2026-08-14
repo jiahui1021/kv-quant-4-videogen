@@ -153,7 +153,8 @@ class CausalInferencePipeline(torch.nn.Module):
             self._initialize_kv_cache(
                 batch_size=batch_size,
                 dtype=noise.dtype,
-                device=noise.device
+                device=noise.device,
+                target_frames=num_output_frames,
             )
             self._initialize_crossattn_cache(
                 batch_size=batch_size,
@@ -169,10 +170,11 @@ class CausalInferencePipeline(torch.nn.Module):
                 reset_qvg_cache(self)
             else:
                 for block_index in range(len(self.kv_cache1)):
-                    self.kv_cache1[block_index]["global_end_index"] = torch.tensor(
-                        [0], dtype=torch.long, device=noise.device)
-                    self.kv_cache1[block_index]["local_end_index"] = torch.tensor(
-                        [0], dtype=torch.long, device=noise.device)
+                    # Keep cache cursors on the host.  The attention path only
+                    # needs integer slice bounds; storing CUDA scalars here
+                    # would force a device synchronization on every layer.
+                    self.kv_cache1[block_index]["global_end_index"] = 0
+                    self.kv_cache1[block_index]["local_end_index"] = 0
                     if "quantizer" in self.kv_cache1[block_index]:
                         self.kv_cache1[block_index]["quant_state"] = None
 
@@ -392,7 +394,7 @@ class CausalInferencePipeline(torch.nn.Module):
         else:
             return video
 
-    def _initialize_kv_cache(self, batch_size, dtype, device):
+    def _initialize_kv_cache(self, batch_size, dtype, device, target_frames=None):
         """
         Initialize a Per-GPU KV cache for the Wan model.
         """
@@ -401,15 +403,20 @@ class CausalInferencePipeline(torch.nn.Module):
             # Use the local attention size to compute the KV cache size
             kv_cache_size = self.local_attn_size * self.frame_seq_length
         else:
-            # Use the default KV cache size
-            kv_cache_size = 32760
+            # Global attention must hold the complete requested rollout.  The
+            # old fixed 32760-token allocation only covered 21 latent frames
+            # and failed late when the CLI default requested 180 frames.
+            requested_frames = int(target_frames or 21)
+            kv_cache_size = max(
+                32760, requested_frames * self.frame_seq_length
+            )
 
         for _ in range(self.num_transformer_blocks):
             kv_cache1.append({
                 "k": torch.zeros([batch_size, kv_cache_size, 12, 128], dtype=dtype, device=device),
                 "v": torch.zeros([batch_size, kv_cache_size, 12, 128], dtype=dtype, device=device),
-                "global_end_index": torch.tensor([0], dtype=torch.long, device=device),
-                "local_end_index": torch.tensor([0], dtype=torch.long, device=device)
+                "global_end_index": 0,
+                "local_end_index": 0,
             })
 
         self.kv_cache1 = kv_cache1  # always store the clean cache

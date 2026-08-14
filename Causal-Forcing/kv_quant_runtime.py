@@ -97,8 +97,15 @@ def reset_quantized_kv_cache(pipeline) -> None:
     """Reset indices and compressed state before processing a new prompt."""
     for cache_list in _cache_lists(pipeline):
         for block in cache_list:
-            block["global_end_index"].fill_(0)
-            block["local_end_index"].fill_(0)
+            for name in ("global_end_index", "local_end_index"):
+                value = block[name]
+                if isinstance(value, torch.Tensor):
+                    # Keep the legacy tensor object intact for callers that
+                    # own it, while accepting the host-integer cursors used by
+                    # the current Causal-Forcing pipeline.
+                    value.fill_(0)
+                else:
+                    block[name] = 0
             block["quant_state"] = None
             block.pop("eviction_slack_tokens", None)
             for key in ("recent_k", "recent_v"):

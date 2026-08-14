@@ -10,6 +10,7 @@ NUM_OUTPUT_FRAMES="${NUM_OUTPUT_FRAMES:-180}"
 LOCAL_ATTN_SIZE="${LOCAL_ATTN_SIZE:-180}"
 RETAIN_FINAL_CACHE="${RETAIN_FINAL_CACHE:-1}"
 USE_EMA="${USE_EMA:-0}"
+PROFILE_QUANT_TIMING="${PROFILE_QUANT_TIMING:-0}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 
 if [[ "$RETAIN_FINAL_CACHE" != 0 && "$RETAIN_FINAL_CACHE" != 1 ]]; then
@@ -18,6 +19,10 @@ if [[ "$RETAIN_FINAL_CACHE" != 0 && "$RETAIN_FINAL_CACHE" != 1 ]]; then
 fi
 if [[ "$USE_EMA" != 0 && "$USE_EMA" != 1 ]]; then
   echo "USE_EMA must be 0 or 1" >&2
+  exit 2
+fi
+if [[ "$PROFILE_QUANT_TIMING" != 0 && "$PROFILE_QUANT_TIMING" != 1 ]]; then
+  echo "PROFILE_QUANT_TIMING must be 0 or 1" >&2
   exit 2
 fi
 export CAUSAL_FORCING_BENCHMARK="${CAUSAL_FORCING_BENCHMARK:-1}"
@@ -51,6 +56,7 @@ for method in "${METHODS[@]}"; do
   fi
   [[ "$RETAIN_FINAL_CACHE" == 1 ]] && method_args+=(--retain_final_cache)
   [[ "$USE_EMA" == 1 ]] && method_args+=(--use_ema)
+  [[ "$PROFILE_QUANT_TIMING" == 1 ]] && method_args+=(--profile_quant_timing)
   "${PYTHON_BIN}" Causal-Forcing/inference.py \
     --config_path "${CONFIG_PATH}" \
     --checkpoint_path "${CHECKPOINT_PATH}" \

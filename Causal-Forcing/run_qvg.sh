@@ -10,6 +10,7 @@ NUM_OUTPUT_FRAMES="${NUM_OUTPUT_FRAMES:-180}"
 LOCAL_ATTN_SIZE="${LOCAL_ATTN_SIZE:-180}"
 RETAIN_FINAL_CACHE="${RETAIN_FINAL_CACHE:-1}"
 USE_EMA="${USE_EMA:-0}"
+PROFILE_QUANT_TIMING="${PROFILE_QUANT_TIMING:-0}"
 OUTPUT_FOLDER="${OUTPUT_FOLDER:-results/qvg/${METHOD}}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 
@@ -21,6 +22,10 @@ if [[ "$USE_EMA" != 0 && "$USE_EMA" != 1 ]]; then
   echo "USE_EMA must be 0 or 1" >&2
   exit 2
 fi
+if [[ "$PROFILE_QUANT_TIMING" != 0 && "$PROFILE_QUANT_TIMING" != 1 ]]; then
+  echo "PROFILE_QUANT_TIMING must be 0 or 1" >&2
+  exit 2
+fi
 export CAUSAL_FORCING_BENCHMARK="${CAUSAL_FORCING_BENCHMARK:-1}"
 
 extra_args=()
@@ -29,6 +34,9 @@ if [[ "${QVG_DISABLE_COMPRESSION:-0}" == "1" ]]; then
 fi
 if [[ "$RETAIN_FINAL_CACHE" == 1 ]]; then
   extra_args+=(--retain_final_cache)
+fi
+if [[ "$PROFILE_QUANT_TIMING" == 1 ]]; then
+  extra_args+=(--profile_quant_timing)
 fi
 
 "${PYTHON_BIN}" Causal-Forcing/inference.py \
@@ -45,6 +53,5 @@ fi
   --qvg_kmeans_max_iters 2 \
   --qvg_quant_block_size 64 \
   --qvg_num_prq_stages 1 \
-  --profile_quant_timing \
   --report_timing \
   "${extra_args[@]}"

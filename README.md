@@ -176,6 +176,8 @@ bash Causal-Forcing/run_baseline_matrix.sh
 
 Set `USE_EMA=1` when the checkpoint contains EMA weights; the formal launcher
 defaults to the regular `generator` weights so it matches the Tempokv launcher.
+Set `PROFILE_QUANT_TIMING=1` only when the optional CUDA-event quantizer timing
+breakdown is needed; it is disabled by default for fair latency measurement.
 
 ## Generation metrics
 

@@ -179,6 +179,8 @@ bash Causal-Forcing/run_baseline_matrix.sh
 
 checkpoint 包含 EMA 权重时设置 `USE_EMA=1`；正式 launcher 默认使用普通
 `generator` 权重，与 Tempokv launcher 保持一致。
+只有需要量化器 CUDA event 分解时才设置 `PROFILE_QUANT_TIMING=1`；为保证 latency
+公平比较，默认关闭。
 
 ## 生成指标
 

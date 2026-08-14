@@ -216,12 +216,10 @@ def _initialize_pipeline_cache_shells(pipeline, dtype, device) -> None:
             "v": torch.empty(
                 1, 0, num_heads, head_dim, dtype=dtype, device=device
             ),
-            "global_end_index": torch.zeros(
-                1, dtype=torch.long, device=device
-            ),
-            "local_end_index": torch.zeros(
-                1, dtype=torch.long, device=device
-            ),
+            # Cursors are used only as Python slice bounds.  CUDA scalar
+            # tensors would synchronize the device on every attention call.
+            "global_end_index": 0,
+            "local_end_index": 0,
         }
         for _ in range(num_layers)
     ]
@@ -306,8 +304,8 @@ def attach_qvg_to_pipeline(
             block["kv_cache_size"] = max_num_chunks * int(
                 pipeline.frame_seq_length
             )
-            block["global_end_index"].zero_()
-            block["local_end_index"].zero_()
+            block["global_end_index"] = 0
+            block["local_end_index"] = 0
             block["qvg_evicted_until"] = 0
             block.pop("quantizer", None)
             block.pop("quant_state", None)
@@ -334,8 +332,8 @@ def reset_qvg_cache(pipeline, reset_stats: bool = True) -> None:
                 continue
             block["k"].clear()
             block["v"].clear()
-            block["global_end_index"].zero_()
-            block["local_end_index"].zero_()
+            block["global_end_index"] = 0
+            block["local_end_index"] = 0
             block["qvg_evicted_until"] = 0
     stats = getattr(pipeline, "qvg_stats", None)
     if reset_stats and stats is not None:
@@ -392,8 +390,8 @@ def ensure_qvg_capacity(pipeline, required_frames: int) -> None:
             block["kv_cache_size"] = required_frames * int(
                 pipeline.frame_seq_length
             )
-            block["global_end_index"].zero_()
-            block["local_end_index"].zero_()
+            block["global_end_index"] = 0
+            block["local_end_index"] = 0
             block["qvg_evicted_until"] = 0
     pipeline.qvg_max_num_chunks = required_frames
 
