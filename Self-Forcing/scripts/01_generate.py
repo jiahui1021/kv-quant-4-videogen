@@ -426,9 +426,12 @@ def initialize_pipeline(
     use_ema: bool,
     device: torch.device,
     low_memory: bool,
+    local_attn_size: Optional[int] = None,
 ):
     config = OmegaConf.load(str(default_config_path))
     config = OmegaConf.merge(config, OmegaConf.load(str(config_path)))
+    if local_attn_size is not None:
+        config.model_kwargs.local_attn_size = int(local_attn_size)
 
     if hasattr(config, "denoising_step_list"):
         pipeline = CausalInferencePipeline(config, device=device)
@@ -596,6 +599,7 @@ def run(args: argparse.Namespace) -> None:
         raise RuntimeError("CUDA is required for Self-Forcing generation.")
 
     device = torch.device(args.device)
+    cache_policy = {"cadence": "per_step", "recent_blocks": 0}
     method_name, quantizer = parse_method(
         args.method,
         args.bits,
@@ -676,6 +680,7 @@ def run(args: argparse.Namespace) -> None:
         use_ema=args.use_ema,
         device=device,
         low_memory=low_memory,
+        local_attn_size=args.local_attn_size,
     )
     attach_flowcache_native(pipeline, method_name, args)
     if quantizer is not None and hasattr(quantizer, "set_runtime_context"):
@@ -718,6 +723,20 @@ def run(args: argparse.Namespace) -> None:
             # This avoids persistent BF16 KV residency for quantized methods.
             block["k"] = torch.empty(0, dtype=torch.bfloat16, device=device)
             block["v"] = torch.empty(0, dtype=torch.bfloat16, device=device)
+
+    if args.paper_latency_phase is not None:
+        from paper_latency_runtime import run_paper_latency
+
+        run_paper_latency(
+            args,
+            pipeline,
+            quantizer,
+            method_name,
+            prompts,
+            reset_kv_state,
+            finalize_kv_state,
+        )
+        return
 
     run_log_path = logs_dir / f"generation_{method_name}.jsonl"
     run_log_f = run_log_path.open("a", encoding="utf-8")
@@ -964,6 +983,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--fps", type=int, default=16)
     parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument(
+        "--local-attn-size",
+        type=int,
+        default=None,
+        help="Override the causal attention window in latent frames.",
+    )
     parser.add_argument("--results-root", type=Path, default=REPO_ROOT / "results")
     parser.add_argument("--use-ema", action="store_true", default=True)
     parser.add_argument("--low-memory", action="store_true", help="Enable official dynamic-swap low-memory mode.")
@@ -981,6 +1006,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vram-sample-interval-s", type=float, default=0.2, help="VRAM trace sampling interval in seconds.")
     parser.add_argument("--vram-max-points", type=int, default=1000, help="Maximum stored points per prompt trace.")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--paper-latency-phase",
+        choices=("compilation", "pair"),
+        default=None,
+        help="Run the formal paired RTN latency protocol without writing video.",
+    )
     return parser
 
 

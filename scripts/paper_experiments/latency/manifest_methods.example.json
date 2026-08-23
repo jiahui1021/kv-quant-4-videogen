@@ -1,0 +1,26 @@
+{
+  "RTN_INT2": [
+    "python",
+    "/Users/hui/Desktop/code/kv-quant-4-videogen/scripts/paper_experiments/latency/run_rtn.py",
+    "--phase", "{phase}",
+    "--method", "RTN_INT2",
+    "--frames", "{frames}",
+    "--config-path", "REPLACE_ME_CONFIG",
+    "--default-config-path", "REPLACE_ME_DEFAULT_CONFIG",
+    "--checkpoint-path", "REPLACE_ME_CHECKPOINT",
+    "--prompt-path", "REPLACE_ME_PROMPT",
+    "--output-dir", "{output_dir}/rtn_int2"
+  ],
+  "RTN_INT4": [
+    "python",
+    "/Users/hui/Desktop/code/kv-quant-4-videogen/scripts/paper_experiments/latency/run_rtn.py",
+    "--phase", "{phase}",
+    "--method", "RTN_INT4",
+    "--frames", "{frames}",
+    "--config-path", "REPLACE_ME_CONFIG",
+    "--default-config-path", "REPLACE_ME_DEFAULT_CONFIG",
+    "--checkpoint-path", "REPLACE_ME_CHECKPOINT",
+    "--prompt-path", "REPLACE_ME_PROMPT",
+    "--output-dir", "{output_dir}/rtn_int4"
+  ]
+}
