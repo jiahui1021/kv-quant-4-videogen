@@ -23,6 +23,7 @@ QVG-specific code stays in the Causal-Forcing adapter.
 
 ```text
 kv-quant-4-videogen/
+├── Forcing-KV/                       # Integrated Forcing-KV source snapshot
 ├── kv_quant/                         # Shared RTN/KIVI/QuaRot implementation
 ├── LongCat/
 │   ├── kv_quant_adapter.py           # LongCat [B,H,S,D] layout adapter
@@ -36,6 +37,19 @@ kv-quant-4-videogen/
 ├── third_party/Quant-VideoGen/       # Pinned official QVG codec
 └── Self-Forcing/                     # Existing Self-Forcing implementation
 ```
+
+The integrated Forcing-KV source has a one-video Self-Forcing/Causal-Forcing
+717-frame smoke runner. It writes resident KV bytes and the corresponding
+BF16-equivalent compression ratio:
+
+```bash
+FORCING_KV_PRETRAINED_ROOT=/path/to/pretrained \
+SF_CHECKPOINT_PATH=/path/to/self_forcing.pt \
+CF_CHECKPOINT_PATH=/path/to/causal_forcing.pt \
+bash Forcing-KV/scripts/run_sf_cf_717.sh --only both
+```
+
+Reports are written under `Forcing-KV/results/sf_cf_717/<workload>/efficiency/`.
 
 ## Requirements
 
