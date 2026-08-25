@@ -63,10 +63,18 @@ def _geometry(cache: dict[str, Any]) -> tuple[int, int, int]:
 def measure_cache(
     kv_cache: list[dict[str, Any]],
     *,
+    logical_tokens: int | None = None,
     default_num_heads: int = 12,
     default_head_dim: int = 128,
 ) -> dict[str, Any]:
-    """Measure resident bytes and a full-head BF16 equivalent."""
+    """Measure resident bytes and a full-head BF16 equivalent.
+
+    ``logical_tokens`` is the requested full KV-cache capacity for the run.
+    Forcing-KV does not maintain the generic ``local_end_index`` cursor after
+    switching to grouped caches, so using that cursor alone can incorrectly
+    produce a zero numerator. The requested capacity is the correct BF16
+    reference for this cache policy.
+    """
     if not kv_cache:
         return {
             "num_layers": 0,
@@ -78,20 +86,25 @@ def measure_cache(
     seen: set[tuple[int, int]] = set()
     resident_bytes = _tensor_bytes(kv_cache, key=None, seen=seen)
     equivalent_bytes = 0
+    resolved_tokens = int(logical_tokens or 0)
     for cache in kv_cache:
         batch, heads, head_dim = _geometry(cache)
         heads = heads or default_num_heads
         head_dim = head_dim or default_head_dim
-        # local_end_index is the number of resident token positions after a
-        # local/history policy. Fall back to the absolute cursor for caches
-        # that keep the complete sequence.
-        tokens = _scalar(cache.get("local_end_index"))
-        if tokens <= 0:
-            tokens = _scalar(cache.get("global_end_index"))
+        if resolved_tokens <= 0:
+            # This fallback is useful for unit tests and cache snapshots that
+            # still expose cursors. Runtime inference passes logical_tokens
+            # explicitly because grouped caches do not keep those cursors.
+            tokens = _scalar(cache.get("local_end_index"))
+            if tokens <= 0:
+                tokens = _scalar(cache.get("global_end_index"))
+        else:
+            tokens = resolved_tokens
         equivalent_bytes += batch * tokens * heads * head_dim * 2 * 2
 
     return {
         "num_layers": len(kv_cache),
+        "logical_tokens": resolved_tokens,
         "resident_kv_bytes": int(resident_bytes),
         "bf16_equivalent_bytes": int(equivalent_bytes),
         "compression_ratio": (

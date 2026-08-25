@@ -291,7 +291,10 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
     if local_rank == 0:
         from tools.forcing_kv_compression_ratio import measure_cache, write_report
 
-        compression = measure_cache(pipeline.kv_cache1)
+        compression = measure_cache(
+            pipeline.kv_cache1,
+            logical_tokens=int(config.num_output_frames) * int(pipeline.frame_seq_length),
+        )
         compression.update(
             {
                 "workload": "self_forcing"

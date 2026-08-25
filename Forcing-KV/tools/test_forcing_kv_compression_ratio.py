@@ -22,3 +22,15 @@ def test_ratio_counts_actual_kv_storage_and_full_head_equivalent():
 def test_empty_cache_is_explicitly_unavailable():
     report = measure_cache([])
     assert report["compression_ratio"] is None
+
+
+def test_requested_cache_capacity_is_used_without_runtime_cursors():
+    cache = [
+        {
+            "sink_k": torch.zeros(1, 1, 3, 4, dtype=torch.bfloat16),
+            "sink_v": torch.zeros(1, 1, 3, 4, dtype=torch.bfloat16),
+        }
+    ]
+    report = measure_cache(cache, logical_tokens=24)
+    assert report["bf16_equivalent_bytes"] == 24 * 3 * 4 * 2 * 2
+    assert report["compression_ratio"] > 1.0
