@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import re
+import statistics
 import subprocess
 import sys
 import time
@@ -26,6 +27,8 @@ if str(SELF_FORCING_ROOT) not in sys.path:
     sys.path.insert(0, str(SELF_FORCING_ROOT))
 
 from kv_quant.factory import create_quantizer
+from kv_quant import efficiency_record
+from kv_quant.efficiency_hook import SamplingQuantizer
 from pipeline import CausalInferencePipeline, CausalDiffusionInferencePipeline
 from utils.misc import set_seed
 from demo_utils.memory import DynamicSwapInstaller, get_cuda_free_memory_gb
@@ -354,6 +357,48 @@ def load_layer_budget_table(path_str: Optional[str]) -> Dict[int, float] | None:
     return {int(k): float(v) for k, v in payload.items()}
 
 
+_PAPER_METHODS = {
+    "BF16": ("BF16", None),
+    "RTN_INT2": ("RTN", 2), "RTN_INT4": ("RTN", 4),
+    "KIVI_INT2": ("KIVI", 2), "KIVI_INT4": ("KIVI", 4),
+    "QUAROT_KV_INT2": ("QuaRot-KV", 2), "QUAROT_KV_INT4": ("QuaRot-KV", 4),
+}
+
+
+def _paper_method_label(method_name: str) -> tuple[str, int | None]:
+    """Map a runtime method name onto its row in the paper's tables.
+
+    Only the methods that keep the full sequence are accepted.  The pruning
+    families evict tokens, which breaks the collector's requirement that every
+    row's BF16 equivalent match the BF16 run's resident bytes, so they are
+    rejected here rather than quietly producing an incomparable row.
+    """
+    try:
+        return _PAPER_METHODS[method_name]
+    except KeyError:
+        raise ValueError(
+            f"{method_name} is not one of the paper's efficiency rows; "
+            "token-evicting methods need their own accounting (design spec 4.4)"
+        ) from None
+
+
+def _efficiency_gpu_uuid() -> str:
+    """The device UUID, so the collector can prove one card ran every method.
+
+    Best effort: this runs after a generation has already produced its videos,
+    and no provenance lookup is worth losing that work to.  An empty result
+    hides nothing -- the collector rejects a record whose ``gpu_uuid`` does not
+    match the manifest, empty included.
+    """
+    try:
+        return subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=uuid", "--format=csv,noheader"],
+            text=True,
+        ).strip().splitlines()[0]
+    except Exception:
+        return ""
+
+
 def load_prompts(prompt_path: Path, max_prompts: Optional[int]) -> List[Tuple[int, str]]:
     prompts: List[Tuple[int, str]] = []
     with prompt_path.open("r", encoding="utf-8") as f:
@@ -506,53 +551,44 @@ def ensure_kv_cache_capacity(pipeline, num_output_frames: int, dtype: torch.dtyp
 
 
 def _current_active_kv_bytes(pipeline, quantizer) -> tuple[int, int]:
-    kv_cache = getattr(pipeline, "kv_cache1", None)
-    if kv_cache is None:
+    """Return BF16-equivalent and resident bytes from live cache tensors.
+
+    The old trace path reconstructed this number from cache policy metadata.
+    Efficiency records use the sampling wrapper's actual tensor walk instead;
+    the fallback below keeps the diagnostic trace useful for unwrapped callers
+    without reintroducing a configuration-derived byte figure.
+    """
+    kv_cache = getattr(pipeline, "kv_cache1", None) or []
+    if not kv_cache:
         return 0, 0
 
-    bf16_bytes = 0
-    compressed_bytes = 0
-    for block in kv_cache:
-        active_tokens = int(block.get("local_end_index", torch.tensor([0])).item())
-        if isinstance(block.get("k"), torch.Tensor) and block["k"].ndim == 4 and block["k"].numel() > 0:
-            batch_size, _, num_heads, head_dim = block["k"].shape
-        else:
-            batch_size = int(block.get("batch_size", 0))
-            num_heads = int(block.get("num_heads", 0))
-            head_dim = int(block.get("head_dim", 0))
-        if active_tokens <= 0 or batch_size <= 0 or num_heads <= 0 or head_dim <= 0:
-            continue
-        bf16_bytes += batch_size * active_tokens * num_heads * head_dim * 2 * 2
-        if quantizer is None:
-            compressed_bytes += batch_size * active_tokens * num_heads * head_dim * 2 * 2
-        else:
-            quant_state = block.get("quant_state")
-            if (
-                quant_state is not None
-                and callable(getattr(quantizer, "init_state", None))
-                and hasattr(quantizer, "memory_bytes")
-            ):
-                # The shared baselines account for packed segments, scales,
-                # and their BF16 residual/write buffers directly from state.
-                compressed_bytes += int(quantizer.memory_bytes(quant_state))
-                continue
-            frame_seq_length = int(block.get("frame_seq_length", 0))
-            num_frame_per_block = int(block.get("num_frame_per_block", 1))
-            recent_blocks = int(block.get("recent_blocks", 0))
-            recent_tokens = 0
-            if frame_seq_length > 0 and recent_blocks > 0:
-                recent_tokens = min(active_tokens, recent_blocks * num_frame_per_block * frame_seq_length)
-            old_tokens = max(active_tokens - recent_tokens, 0)
-            compressed_bytes += int(
-                quantizer.estimate_active_kv_bytes(
-                    active_tokens=old_tokens,
-                    batch_size=batch_size,
-                    num_heads=num_heads,
-                    head_dim=head_dim,
-                )
-            )
-            compressed_bytes += batch_size * recent_tokens * num_heads * head_dim * 2 * 2
-    return int(bf16_bytes), int(compressed_bytes)
+    resident_method = getattr(quantizer, "resident_kv_bytes", None)
+    if callable(resident_method):
+        resident, equivalent = resident_method()
+        return int(equivalent), int(resident)
+
+    from kv_quant.efficiency_record import tensor_bytes, bf16_equivalent_bytes
+
+    resident = tensor_bytes(kv_cache)
+    first = kv_cache[0]
+    end_index = first.get("local_end_index", 0)
+    tokens = int(end_index.item()) if isinstance(end_index, torch.Tensor) else int(end_index)
+    geometry = first.get("k")
+    if isinstance(geometry, torch.Tensor) and geometry.ndim == 4:
+        batch, _, heads, head_dim = geometry.shape
+    else:
+        batch = int(first.get("batch_size", 0))
+        heads = int(first.get("num_heads", 0))
+        head_dim = int(first.get("head_dim", 0))
+    equivalent = bf16_equivalent_bytes(
+        int(batch), tokens, int(heads), int(head_dim)
+    ) * len(kv_cache)
+    if quantizer is None:
+        # With BF16 caches the tensor walk is already the resident source.  The
+        # equivalent is kept tied to the same live allocation for preallocated
+        # cache implementations.
+        equivalent = resident
+    return int(equivalent), int(resident)
 
 
 def _sample_trace(device: torch.device, pipeline, quantizer, start_time: float, out_samples: List[Dict[str, float]]) -> None:
@@ -698,6 +734,44 @@ def run(args: argparse.Namespace) -> None:
     pipeline._initialize_kv_cache(batch_size=1, dtype=torch.bfloat16, device=device)
     pipeline._initialize_crossattn_cache(batch_size=1, dtype=torch.bfloat16, device=device)
     ensure_kv_cache_capacity(pipeline, args.num_output_frames, dtype=torch.bfloat16, device=device)
+
+    # Resident-byte sampling rides on the quantizer because this repository has
+    # no pipeline-level block hook: quantization happens inside the patched
+    # attention layer.  Wrapping here, before reset_kv_state installs the
+    # quantizer on every block, means every layer's call is seen.
+    if quantizer is not None:
+        quantizer = SamplingQuantizer(
+            quantizer,
+            cache_getter=lambda: getattr(pipeline, "kv_cache1", None) or [],
+            num_layers=len(pipeline.kv_cache1 or []) or 30,
+        )
+
+    # VAE decode is the one latency segment this repository never measured.
+    # decode_to_pixel is upstream Self-Forcing's own method, so the same wrap
+    # target works in all three repositories.
+    vae_decode = {"total_ms": 0.0, "calls": 0, "pending": []}
+    _vae_type = type(pipeline.vae)
+    _original_decode_to_pixel = _vae_type.decode_to_pixel
+
+    def _timed_decode_to_pixel(self, *decode_args, **decode_kwargs):
+        use_cuda_events = torch.cuda.is_available()
+        if use_cuda_events:
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
+        else:
+            started = time.perf_counter()
+        try:
+            return _original_decode_to_pixel(self, *decode_args, **decode_kwargs)
+        finally:
+            if use_cuda_events:
+                end_event.record()
+                vae_decode["pending"].append((start_event, end_event))
+            else:
+                vae_decode["total_ms"] += (time.perf_counter() - started) * 1000.0
+            vae_decode["calls"] += 1
+
+    _vae_type.decode_to_pixel = _timed_decode_to_pixel
     if quantizer is not None:
         quantizer.reset_stats()
         num_layers = len(pipeline.kv_cache1)
@@ -746,6 +820,9 @@ def run(args: argparse.Namespace) -> None:
         vram_trace_f = vram_trace_path.open("a", encoding="utf-8")
 
     total_runtime_s = 0.0
+    per_prompt_runtime_s: List[float] = []
+    per_prompt_peak_bytes: List[int] = []
+    per_prompt_reserved_bytes: List[int] = []
     peak_vram_bytes = 0
     peak_compressed_kv_bytes_seen = 0
     first_video_shape = None
@@ -787,6 +864,7 @@ def run(args: argparse.Namespace) -> None:
                 trace_stop_event.set()
                 trace_thread.join(timeout=5.0)
             peak = int(torch.cuda.max_memory_allocated(device))
+            reserved_peak = int(torch.cuda.max_memory_reserved(device))
             if not vram_samples:
                 vram_samples = [
                     {
@@ -804,6 +882,11 @@ def run(args: argparse.Namespace) -> None:
             )
 
             total_runtime_s += runtime_s
+            per_prompt_runtime_s.append(float(runtime_s))
+            # Peak stats are reset before every prompt above, so this is that
+            # prompt's own peak rather than a running maximum.
+            per_prompt_peak_bytes.append(int(peak))
+            per_prompt_reserved_bytes.append(reserved_peak)
             peak_vram_bytes = max(peak_vram_bytes, peak)
             first_video_shape = tuple(video.shape)
 
@@ -853,6 +936,13 @@ def run(args: argparse.Namespace) -> None:
         run_log_f.close()
         if vram_trace_f is not None:
             vram_trace_f.close()
+
+    if vae_decode["pending"]:
+        torch.cuda.synchronize(device)
+        vae_decode["total_ms"] += sum(
+            start.elapsed_time(end) for start, end in vae_decode["pending"]
+        )
+        vae_decode["pending"].clear()
 
     if pipeline.kv_cache1 is not None:
         bf16_kv_bytes = 0
@@ -917,7 +1007,132 @@ def run(args: argparse.Namespace) -> None:
     with metrics_path.open("w", encoding="utf-8") as f:
         json.dump(efficiency, f, indent=2)
 
+    _write_shared_efficiency_record(
+        Path(args.efficiency_output).expanduser()
+        if args.efficiency_output
+        else metrics_dir / "efficiency.json",
+        args=args,
+        method_name=method_name,
+        prompts=prompts,
+        quantizer=quantizer,
+        pipeline=pipeline,
+        per_prompt_runtime_s=per_prompt_runtime_s,
+        per_prompt_peak_bytes=per_prompt_peak_bytes,
+        per_prompt_reserved_bytes=per_prompt_reserved_bytes,
+        vae_decode=vae_decode,
+        device=device,
+    )
+
     print(json.dumps(efficiency, indent=2))
+
+
+def _write_shared_efficiency_record(
+    path: Path,
+    *,
+    args: argparse.Namespace,
+    method_name: str,
+    prompts: List[Tuple[int, str]],
+    quantizer,
+    pipeline,
+    per_prompt_runtime_s: List[float],
+    per_prompt_peak_bytes: List[int],
+    per_prompt_reserved_bytes: List[int],
+    vae_decode: Dict[str, float],
+    device: torch.device,
+) -> None:
+    """Emit the cross-repository ``efficiency.v1`` record.
+
+    Written beside this repository's own ``efficiency_<method>.json``, which
+    keeps its existing shape: that file answers questions specific to these
+    baselines, this one is the row the shared collector reads.
+    """
+    import hashlib
+
+    label, bits = _paper_method_label(method_name)
+    prompt_indices = [prompt_id for prompt_id, _ in prompts]
+    sampler = (
+        quantizer.sampler
+        if isinstance(quantizer, SamplingQuantizer)
+        else efficiency_record.ResidentSampler()
+    )
+    quantized = quantizer is not None
+    stats = quantizer.stats if quantized else None
+    segments = {
+        # Per-prompt wall clock is the only end-to-end figure this runner has;
+        # the reported horizon-level number is the median prompt, matching the
+        # generation_seconds_median the other two repositories report.
+        "e2e": (
+            statistics.median(per_prompt_runtime_s[1:]) * 1000.0
+            if len(per_prompt_runtime_s) > 1
+            else (per_prompt_runtime_s[0] * 1000.0 if per_prompt_runtime_s else None)
+        ),
+        "cache_encode": float(stats.quantize_time_s) * 1000.0 if quantized else 0.0,
+        "cache_decode": float(stats.dequantize_time_s) * 1000.0 if quantized else 0.0,
+        "vae_decode": vae_decode["total_ms"] if vae_decode["calls"] else None,
+    }
+    instrumentation = {
+        "e2e": "patched" if per_prompt_runtime_s else "missing: no prompt completed",
+        "cache_encode": "patched" if quantized else "absent: no codec",
+        "cache_decode": "patched" if quantized else "absent: no codec",
+        "vae_decode": (
+            "patched" if vae_decode["calls"] else "missing: decode_to_pixel"
+        ),
+    }
+    prompt_bytes = Path(args.prompt_path).expanduser().read_bytes()
+    # Prompt 0 is the warm-up: peak stats are reset before every prompt, so the
+    # reported peak is the largest of the prompts after it.
+    measured_peaks = per_prompt_peak_bytes[1:] or per_prompt_peak_bytes
+    efficiency_record.write_record(
+        path,
+        efficiency_record.build_efficiency_payload(
+            repo="kv-quant-4-videogen",
+            method=label,
+            bits=bits,
+            run={
+                "model": "Self-Forcing",
+                "width": 832,
+                "height": 480,
+                "frames": int(args.num_output_frames) * 4 - 3,
+                "latent_frames": int(args.num_output_frames),
+                "prompts_sha256": hashlib.sha256(prompt_bytes).hexdigest(),
+                "prompt_indices": prompt_indices,
+                "seed": int(args.seed),
+                "num_gpus": 1,
+                "gpu_name": torch.cuda.get_device_name(device),
+                "gpu_uuid": _efficiency_gpu_uuid(),
+                "torch_version": torch.__version__,
+                "cuda_version": torch.version.cuda or "",
+                "local_attn_size": int(
+                    pipeline.generator.model.local_attn_size
+                ),
+            },
+            sampler=sampler,
+            cache_shape={
+                "num_layers": 30,
+                "num_heads": 12,
+                "head_dim": 128,
+                "frame_seq_length": 1560,
+                "batch_size": 1,
+            },
+            fake_quant=False,
+            predictor_parameter_bytes=0,
+            gpu_memory={
+                "peak_allocated_bytes": max(measured_peaks) if measured_peaks else 0,
+                "peak_reserved_bytes": max(
+                    per_prompt_reserved_bytes[1:] or per_prompt_reserved_bytes or [
+                        int(torch.cuda.max_memory_reserved(device))
+                    ]
+                ),
+                "peak_reset_after_prompt_index": (
+                    prompt_indices[0] if prompt_indices else 0
+                ),
+            },
+            per_prompt_generation_seconds=per_prompt_runtime_s,
+            prompt_indices=prompt_indices,
+            segments_ms=segments,
+            instrumentation=instrumentation,
+        ),
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -990,6 +1205,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override the causal attention window in latent frames.",
     )
     parser.add_argument("--results-root", type=Path, default=REPO_ROOT / "results")
+    parser.add_argument(
+        "--efficiency-output",
+        type=Path,
+        default=None,
+        help="Optional path for the shared efficiency.v1 record.",
+    )
     parser.add_argument("--use-ema", action="store_true", default=True)
     parser.add_argument("--low-memory", action="store_true", help="Enable official dynamic-swap low-memory mode.")
     parser.add_argument(
