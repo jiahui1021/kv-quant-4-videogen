@@ -18,12 +18,14 @@ It runs one 180-latent-frame / 717-pixel-frame video for Self-Forcing and
 Causal-Forcing, then writes one report per workload under
 `efficiency/compression_ratio_0.json`.
 
-The reported ratio is:
+The reported ratio compares the requested 717-frame KV-cache capacity with the
+actual live grouped-cache tensors:
 
 ```text
-BF16-equivalent resident bytes / actual resident KV tensor bytes
+full requested KV cache as BF16 with all heads / actual resident KV tensor bytes
 ```
 
 The denominator is obtained by walking the live K/V tensors, including the
 head-group and dynamic-history buffers. The numerator represents the same
-resident logical token positions with all heads stored as BF16.
+180-latent-frame cache capacity with all 12 heads stored as BF16. It does not
+inspect or depend on `quantization_enabled`.

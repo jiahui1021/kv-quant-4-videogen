@@ -3,7 +3,7 @@
 Forcing-KV compresses by assigning different head groups different resident
 history lengths. The ratio below therefore comes from the tensors that are
 actually alive in ``pipeline.kv_cache1`` and a BF16 full-head equivalent for
-the same logical resident token count.
+the requested KV-cache capacity.
 """
 
 from __future__ import annotations
