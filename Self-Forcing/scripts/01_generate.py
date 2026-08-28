@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+from __future__ import annotations
+
 import argparse
 import json
 import os
@@ -361,11 +363,11 @@ _PAPER_METHODS = {
     "BF16": ("BF16", None),
     "RTN_INT2": ("RTN", 2), "RTN_INT4": ("RTN", 4),
     "KIVI_INT2": ("KIVI", 2), "KIVI_INT4": ("KIVI", 4),
-    "QUAROT_KV_INT2": ("QuaRot-KV", 2), "QUAROT_KV_INT4": ("QuaRot-KV", 4),
+    "QUAROT_KV_INT2": ("QuaRot", 2), "QUAROT_KV_INT4": ("QuaRot", 4),
 }
 
 
-def _paper_method_label(method_name: str) -> tuple[str, int | None]:
+def _paper_method_label(method_name: str):
     """Map a runtime method name onto its row in the paper's tables.
 
     Only the methods that keep the full sequence are accepted.  The pruning

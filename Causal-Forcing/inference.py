@@ -67,7 +67,37 @@ parser.add_argument(
     "--block_size",
     type=int,
     default=16,
-    help="Sequence block size for shared RTN/KIVI/QuaRot KV quantization",
+    help=(
+        "Legacy group-size shortcut: RTN uses it for channel groups; KIVI "
+        "uses it for key sequence groups and value channel groups"
+    ),
+)
+parser.add_argument(
+    "--kv_channel_group_size",
+    type=int,
+    default=None,
+    help=(
+        "Quantization group size in channels. QuaRot accepts only -1 "
+        "(token-wise) or head_dim; RTN/KIVI use --block_size instead"
+    ),
+)
+parser.add_argument(
+    "--kv_asym",
+    action="store_true",
+    help=(
+        "QuaRot only: asymmetric KV quantization (--k_asym/--v_asym upstream, "
+        "off by default). Worth setting at INT2, where the symmetric range "
+        "leaves only three usable codes"
+    ),
+)
+parser.add_argument(
+    "--kv_clip_ratio",
+    type=float,
+    default=None,
+    help=(
+        "QuaRot only: shrink the quantization range (--k_clip_ratio upstream, "
+        "1.0 by default). Trades tail clipping for resolution near zero"
+    ),
 )
 parser.add_argument(
     "--profile_quant_timing",
@@ -274,7 +304,11 @@ if qvg_enabled:
     )
 else:
     method_name, quantizer = parse_method(
-        args.method, block_size=args.block_size
+        args.method,
+        block_size=args.block_size,
+        channel_group_size=args.kv_channel_group_size,
+        asym=args.kv_asym or None,
+        clip_ratio=args.kv_clip_ratio,
     )
 
 if quantizer is not None:

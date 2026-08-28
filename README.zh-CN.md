@@ -1,6 +1,6 @@
 # LongCat 与 Causal-Forcing 的 KV 量化
 
-本仓库为 LongCat 和 Causal-Forcing 提供统一的 KV-cache 量化实现，支持 RTN、KIVI 和 KV-only QuaRot；Causal-Forcing 额外提供官方 QVG INT2 和 INT4 baseline。
+本仓库为 LongCat 和 Causal-Forcing 提供统一的 KV-cache 量化实现，支持 RTN、KIVI 和 KV-only QuaRot（按 `spcl/QuaRot` 官方实现移植）；Causal-Forcing 额外提供官方 QVG INT2 和 INT4 baseline。
 
 [English README](README.md)
 
@@ -11,12 +11,32 @@
 | `BF16` | 16 | 完整精度 KV cache |
 | `RTN_INT4` / `RTN_INT2` | 4 / 2 | Round-to-nearest 对称量化 |
 | `KIVI_INT4` / `KIVI_INT2` | 4 / 2 | KIVI 风格的 K/V 非对称量化 |
-| `QUAROT_KV_INT4` / `QUAROT_KV_INT2` | 4 / 2 | Hadamard 旋转后进行 KV 量化 |
+| `QUAROT_KV_INT4` / `QUAROT_KV_INT2` | 4 / 2 | KV-only QuaRot：RoPE 之后对 Q/K 做同一个 Hadamard 旋转，V 做 head_dim 大小的旋转并在 attention 输出处还原，对称 per-token 量化 |
+| `HADAMARD_K_INT4` / `HADAMARD_K_INT2` | 4 / 2 | 去掉 V 旋转的 QuaRot 消融，不作为 baseline 汇报 |
 | `QVG_INT2` / `QVG_INT4` | 2 / 4 | 官方 Quant-VideoGen semantic smoothing + progressive residual quantization（仅 Causal-Forcing） |
 
 共享量化器默认使用 `block_size=16`；QVG 保留官方 `quant_block_size=64` 和每 8 个
 generation chunk 的独立 schedule。LongCat 和 Causal-Forcing 共同调用根目录
 [`kv_quant/`](kv_quant/) 中的共享实现，QVG 专用代码放在 Causal-Forcing adapter 中。
+
+三个 baseline 各自遵循自己的参考实现，而不是共用一套量化器：RTN 与 QuaRot 是对称的
+（QuaRot 的 `--k_asym`/`--v_asym` 默认关闭），KIVI 是非对称的；QuaRot 的分组固定为一个
+`head_dim`（其 `QKRotationWrapper` 只接受 token-wise 或 `head_dim` 分组），而 RTN 用
+`block_size`。要在同一粒度下对比 RTN 与 QuaRot，请设置 `--block_size 128`。
+
+QuaRot 需要 post-RoPE 的 key，因此 Causal-Forcing 把它路由到专用的
+`_attention_with_quarot_cache`，而不是共享的 pre-RoPE 缓存路径。
+
+QuaRot 的两个量程旋钮已接到 CLI：`--kv_asym`（官方 `--k_asym`/`--v_asym`）和
+`--kv_clip_ratio`（官方 `--k_clip_ratio`/`--v_clip_ratio`），另有
+`--kv_channel_group_size` 用于切到 token-wise（`-1`）分组。它们只对旋转后端有效，
+RTN / KIVI 传入会直接报错而不是静默忽略。
+
+INT2 下默认配置并不合适：对称 absmax 的步长等于组内最大值，4 个码字只有 3 个可达，
+且多数通道会被舍入到 0。`--kv_asym --kv_clip_ratio 0.5` 能挽回大部分损失。官方
+QuaRot 本身没有 2-bit 路径（packing 与 CUDA kernel 全是 `i4`），因此任何 INT2 的
+QuaRot 结果都属于外推，汇报时需注明。
+
 
 ## 目录结构
 

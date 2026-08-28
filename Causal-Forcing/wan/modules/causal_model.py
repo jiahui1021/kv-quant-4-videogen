@@ -142,10 +142,12 @@ class CausalWanSelfAttention(nn.Module):
     def _attention_with_incremental_cache(
         self,
         roped_query,
-        roped_key,
+        raw_key,
         value,
         kv_cache,
         quantizer,
+        grid_sizes,
+        freqs,
         current_start,
         current_end,
         cache_size,
@@ -153,29 +155,38 @@ class CausalWanSelfAttention(nn.Module):
     ):
         """Run attention against an append-only quantized KV cache.
 
-        ``write_k/write_v`` inside the quantizer state represents the current
-        diffusion block.  Self-Forcing evaluates that block several times at
-        different denoising timesteps; replacing this buffer is safe, while
-        all older packed segments remain immutable.
+        Keys are always cached before RoPE. ``write_k/write_v`` inside the
+        quantizer state represents the current diffusion block, so repeated
+        denoising steps can replace it while older packed segments remain
+        immutable. RoPE is applied only after materializing the attention
+        window, using its absolute frame position.
         """
-        attention_space = hasattr(quantizer, "prepare_attention_qk")
-        if attention_space:
-            roped_query, roped_key = quantizer.prepare_attention_qk(roped_query, roped_key)
+        if getattr(quantizer, "requires_special_attention_backend", False):
+            raise ValueError(
+                f"{type(quantizer).__name__} rotates Q/K after RoPE and cannot use "
+                "the shared pre-RoPE cache path; route it to "
+                "_attention_with_quarot_cache instead"
+            )
+        if self.sink_size and self.local_attn_size != -1:
+            raise NotImplementedError(
+                "Shared pre-RoPE RTN/KIVI caches do not support sink retention; "
+                "use sink_size=0 until multi-span RoPE is implemented"
+            )
 
         state = kv_cache.get("quant_state")
         if state is None:
             state = quantizer.init_state(
                 meta={
-                    "shape": (int(roped_key.shape[0]), 0, int(roped_key.shape[2]), int(roped_key.shape[3])),
+                    "shape": (int(raw_key.shape[0]), 0, int(raw_key.shape[2]), int(raw_key.shape[3])),
                     "tensor_dtype": value.dtype,
                     "device": value.device,
-                    "attention_space": attention_space,
+                    "cache_space": "pre_rope",
                 }
             )
 
         previous_global_end = int(int(kv_cache["global_end_index"]))
         previous_tokens = int(state.get("num_tokens", 0))
-        num_new_tokens = int(roped_key.shape[1])
+        num_new_tokens = int(raw_key.shape[1])
 
         if self.local_attn_size != -1 and current_end > previous_global_end:
             requested_eviction = max(previous_tokens + num_new_tokens - int(cache_size), 0)
@@ -192,32 +203,146 @@ class CausalWanSelfAttention(nn.Module):
 
         quantizer.append_kv(
             state,
-            roped_key,
+            raw_key,
             value,
             meta={
                 "tensor_dtype": value.dtype,
                 "absolute_start": int(current_start),
                 "absolute_end": int(current_end),
-                "already_rotated": attention_space,
-                "attention_space": attention_space,
+                "cache_space": "pre_rope",
+            },
+        )
+        cache_raw_k, cache_v = quantizer.materialize_kv(
+            state,
+            meta={
+                "tensor_dtype": value.dtype,
+                "shape": (int(raw_key.shape[0]), 0, int(raw_key.shape[2]), int(raw_key.shape[3])),
+                "device": value.device,
+                "cache_space": "pre_rope",
+            },
+        )
+        local_end_index = int(state.get("num_tokens", cache_raw_k.shape[1]))
+        attention_start = max(0, local_end_index - int(self.max_attention_size))
+        cache_absolute_start = int(current_end) - int(cache_raw_k.shape[1])
+        absolute_attention_start = cache_absolute_start + attention_start
+        if absolute_attention_start % frame_seqlen:
+            raise ValueError("Shared pre-RoPE cache attention must start on a frame boundary")
+        cache_roped_k = causal_rope_apply_long_input(
+            cache_raw_k[:, attention_start:local_end_index],
+            grid_sizes,
+            freqs,
+            start_frame=absolute_attention_start // frame_seqlen,
+        ).type_as(value)
+        x = attention(
+            roped_query,
+            cache_roped_k,
+            cache_v[:, attention_start:local_end_index],
+        )
+
+        kv_cache["quant_state"] = state
+        kv_cache["k"] = value.new_empty(0)
+        kv_cache["v"] = value.new_empty(0)
+        kv_cache["kv_cache_size"] = int(cache_size)
+        return x, local_end_index
+
+    def _attention_with_quarot_cache(
+        self,
+        roped_query,
+        raw_key,
+        value,
+        kv_cache,
+        quantizer,
+        grid_sizes,
+        freqs,
+        current_start,
+        current_end,
+        cache_size,
+        frame_seqlen,
+    ):
+        """Run attention against a QuaRot post-RoPE, rotated KV cache.
+
+        QuaRot refuses pre-RoPE K quantization, so unlike the shared path this
+        one applies RoPE to the new keys at their absolute frame position
+        *before* caching them.  Q and K are then rotated by the same per-head
+        Hadamard and both stay rotated, and V is cached in the rotated basis
+        that QuaRot folds into ``v_proj``.  The attention output is rotated
+        back here, standing in for the inverse that QuaRot folds into
+        ``o_proj``.
+        """
+        if self.sink_size and self.local_attn_size != -1:
+            raise NotImplementedError(
+                "The QuaRot cache does not support sink retention; "
+                "use sink_size=0 until multi-span RoPE is implemented"
+            )
+        if current_start % frame_seqlen:
+            raise ValueError("QuaRot cache writes must start on a frame boundary")
+
+        state = kv_cache.get("quant_state")
+        if state is None:
+            state = quantizer.init_state(
+                meta={
+                    "shape": (int(raw_key.shape[0]), 0, int(raw_key.shape[2]), int(raw_key.shape[3])),
+                    "tensor_dtype": value.dtype,
+                    "device": value.device,
+                    "cache_space": "post_rope",
+                    "attention_space": True,
+                }
+            )
+
+        previous_global_end = int(kv_cache["global_end_index"])
+        previous_tokens = int(state.get("num_tokens", 0))
+        num_new_tokens = int(raw_key.shape[1])
+
+        if self.local_attn_size != -1 and current_end > previous_global_end:
+            requested_eviction = max(previous_tokens + num_new_tokens - int(cache_size), 0)
+            if requested_eviction > 0:
+                removed = quantizer.evict_prefix(state, requested_eviction)
+                # A partial packed block is intentionally retained.  The
+                # attention slice below still enforces the requested window.
+                if removed == 0:
+                    kv_cache["eviction_slack_tokens"] = int(requested_eviction)
+
+        # Positions are absolute, so a key keeps the RoPE phase it was written
+        # with even after the prefix in front of it has been evicted.
+        roped_key = causal_rope_apply(
+            raw_key,
+            grid_sizes,
+            freqs,
+            start_frame=current_start // frame_seqlen,
+        ).type_as(value)
+        rotated_query, rotated_key = quantizer.prepare_attention_qk(roped_query, roped_key)
+        rotated_value = quantizer.prepare_value(value)
+
+        quantizer.append_kv(
+            state,
+            rotated_key,
+            rotated_value,
+            meta={
+                "tensor_dtype": value.dtype,
+                "absolute_start": int(current_start),
+                "absolute_end": int(current_end),
+                "cache_space": "post_rope",
+                "already_rotated": True,
+                "attention_space": True,
             },
         )
         cache_k, cache_v = quantizer.materialize_kv(
             state,
             meta={
                 "tensor_dtype": value.dtype,
-                "shape": (int(roped_key.shape[0]), 0, int(roped_key.shape[2]), int(roped_key.shape[3])),
+                "shape": (int(raw_key.shape[0]), 0, int(raw_key.shape[2]), int(raw_key.shape[3])),
                 "device": value.device,
-                "attention_space": attention_space,
+                "cache_space": "post_rope",
             },
         )
         local_end_index = int(state.get("num_tokens", cache_k.shape[1]))
         attention_start = max(0, local_end_index - int(self.max_attention_size))
         x = attention(
-            roped_query,
+            rotated_query,
             cache_k[:, attention_start:local_end_index],
             cache_v[:, attention_start:local_end_index],
         )
+        x = quantizer.restore_attention_output(x).type_as(value)
 
         kv_cache["quant_state"] = state
         kv_cache["k"] = value.new_empty(0)
@@ -432,18 +557,24 @@ class CausalWanSelfAttention(nn.Module):
                     frame_seqlen=frame_seqlen,
                 )
             elif supports_incremental:
-                roped_key = causal_rope_apply(
-                    k, grid_sizes, freqs,
-                    start_frame=current_start_frame).type_as(v)
                 kv_cache_size = kv_cache.get("kv_cache_size")
                 if kv_cache_size is None:
                     kv_cache_size = int(self.max_attention_size)
-                x, local_end_index = self._attention_with_incremental_cache(
+                # QuaRot needs post-RoPE keys and a rotated attention space,
+                # which the shared pre-RoPE cache cannot provide.
+                cache_path = (
+                    self._attention_with_quarot_cache
+                    if getattr(quantizer, "requires_special_attention_backend", False)
+                    else self._attention_with_incremental_cache
+                )
+                x, local_end_index = cache_path(
                     roped_query=roped_query,
-                    roped_key=roped_key,
+                    raw_key=k,
                     value=v,
                     kv_cache=kv_cache,
                     quantizer=quantizer,
+                    grid_sizes=grid_sizes,
+                    freqs=freqs,
                     current_start=current_start,
                     current_end=current_end,
                     cache_size=int(kv_cache_size),

@@ -40,15 +40,19 @@ class KIVIQuantizer(KVQuantizer):
         value_bits: int | None = None,
         name: str | None = None,
         residual_length: int | None = None,
+        key_group_size: int | None = None,
         value_group_size: int | None = None,
     ) -> None:
         key_bits = bits if key_bits is None else key_bits
         value_bits = bits if value_bits is None else value_bits
-        residual_length = block_size if residual_length is None else int(residual_length)
+        key_group_size = block_size if key_group_size is None else int(key_group_size)
+        if key_group_size <= 0:
+            raise ValueError("key_group_size must be > 0")
+        residual_length = key_group_size if residual_length is None else int(residual_length)
         if residual_length < 0:
             raise ValueError("residual_length must be >= 0")
-        if residual_length % block_size != 0:
-            raise ValueError("residual_length must be a multiple of block_size")
+        if residual_length % key_group_size != 0:
+            raise ValueError("residual_length must be a multiple of key_group_size")
         if value_group_size is not None and value_group_size <= 0:
             raise ValueError("value_group_size must be > 0")
         resolved_name = name or (
@@ -56,36 +60,40 @@ class KIVIQuantizer(KVQuantizer):
         )
         super().__init__(
             bits=bits,
-            block_size=block_size,
+            # Preserve the legacy attribute for integrations, but use the
+            # explicit name below within the quantizer implementation.
+            block_size=key_group_size,
             name=resolved_name,
             key_bits=key_bits,
             value_bits=value_bits,
         )
         self.residual_length = residual_length
+        self.key_group_size = key_group_size
         self.value_group_size = value_group_size
 
     def _resolve_value_group_size(self, head_dim: int) -> int:
-        requested = self.value_group_size or self.block_size
-        if requested > head_dim:
-            requested = head_dim
+        requested = self.value_group_size or self.key_group_size
         if head_dim % requested != 0:
-            if self.value_group_size is not None:
-                raise ValueError(
-                    f"head_dim={head_dim} must be divisible by value_group_size={requested}"
-                )
-            # Keep the default useful for non-Wan head dimensions while
-            # retaining an explicit group size as a strict user contract.
-            requested = torch.gcd(
-                torch.tensor(int(head_dim)), torch.tensor(int(requested))
-            ).item()
-            if requested <= 0:
-                raise ValueError(f"Could not derive a value group size for head_dim={head_dim}")
+            raise ValueError(
+                f"head_dim={head_dim} must be divisible by value_group_size={requested}"
+            )
         return int(requested)
 
     def _quantize_keys(self, x: torch.Tensor) -> Dict[str, Any]:
-        xb, pad_len = _reshape_blocks(x, self.block_size)
+        xb, pad_len = _reshape_blocks(x, self.key_group_size)
         # KIVI K: per channel across the sequence tokens in each block.
-        q, scale, zp = quantize_asym(xb, bits=self.key_bits, reduce_dims=(2,))
+        q, scale, zero = quantize_asym(xb, bits=self.key_bits, reduce_dims=(2,))
+        if pad_len:
+            valid_tokens = self.key_group_size - pad_len
+            tail_q, tail_scale, tail_zero = quantize_asym(
+                xb[:, -1:, :valid_tokens],
+                bits=self.key_bits,
+                reduce_dims=(2,),
+            )
+            q[:, -1:, :valid_tokens] = tail_q
+            q[:, -1:, valid_tokens:] = 0
+            scale[:, -1:] = tail_scale
+            zero[:, -1:] = tail_zero
         return {
             "q": pack_bits(q, self.key_bits, signed=False),
             "q_shape": tuple(q.shape),
@@ -93,23 +101,26 @@ class KIVIQuantizer(KVQuantizer):
             "packed": True,
             "signed": False,
             "scale": scale,
-            "zp": zp,
+            "zero": zero,
             "pad_len": pad_len,
             "orig_shape": tuple(x.shape),
             "bits": self.key_bits,
-            "block_size": self.block_size,
+            "key_group_size": self.key_group_size,
             "axis": "sequence_group_per_channel",
             "tensor_dtype": x.dtype,
         }
 
     def _quantize_values(self, x: torch.Tensor) -> Dict[str, Any]:
-        xb, pad_len = _reshape_blocks(x, self.block_size)
+        xb, pad_len = _reshape_blocks(x, self.key_group_size)
         b, nb, block, h, d = xb.shape
         group_size = self._resolve_value_group_size(d)
         groups = d // group_size
         xg = xb.reshape(b, nb, block, h, groups, group_size)
-        # KIVI V: each token/head/channel-group has its own scale and zp.
-        q, scale, zp = quantize_asym(xg, bits=self.value_bits, reduce_dims=(-1,))
+        # KIVI V: each token/head/channel-group has its own scale/min-offset.
+        q, scale, zero = quantize_asym(xg, bits=self.value_bits, reduce_dims=(-1,))
+        if pad_len:
+            valid_tokens = self.key_group_size - pad_len
+            q[:, -1:, valid_tokens:] = 0
         return {
             "q": pack_bits(q, self.value_bits, signed=False),
             "q_shape": tuple(q.shape),
@@ -117,11 +128,11 @@ class KIVIQuantizer(KVQuantizer):
             "packed": True,
             "signed": False,
             "scale": scale,
-            "zp": zp,
+            "zero": zero,
             "pad_len": pad_len,
             "orig_shape": tuple(x.shape),
             "bits": self.value_bits,
-            "block_size": self.block_size,
+            "key_group_size": self.key_group_size,
             "value_group_size": group_size,
             "axis": "token_head_channel_group",
             "tensor_dtype": x.dtype,
@@ -138,7 +149,7 @@ class KIVIQuantizer(KVQuantizer):
                 signed=bool(state.get("signed", False)),
             )
         dtype = state.get("tensor_dtype", torch.bfloat16)
-        x = dequantize_asym(q, state["scale"], state["zp"], dtype=dtype)
+        x = dequantize_asym(q, state["scale"], state["zero"], dtype=dtype)
         return _unshape_blocks(x, int(state["pad_len"]), int(state["orig_shape"][1]))
 
     def _dequantize_values(self, state: Dict[str, Any]) -> torch.Tensor:
@@ -152,10 +163,11 @@ class KIVIQuantizer(KVQuantizer):
                 signed=bool(state.get("signed", False)),
             )
         shape = tuple(int(dim) for dim in state["orig_shape"])
-        b, nb, block, h, d = shape[0], (shape[1] + self.block_size - 1) // self.block_size, self.block_size, shape[2], shape[3]
+        key_group_size = int(state.get("key_group_size", self.key_group_size))
+        b, nb, block, h, d = shape[0], (shape[1] + key_group_size - 1) // key_group_size, key_group_size, shape[2], shape[3]
         group_size = int(state["value_group_size"])
         groups = d // group_size
-        xg = dequantize_asym(q, state["scale"], state["zp"], dtype=state.get("tensor_dtype", torch.bfloat16))
+        xg = dequantize_asym(q, state["scale"], state["zero"], dtype=state.get("tensor_dtype", torch.bfloat16))
         xb = xg.reshape(b, nb, block, h, d)
         return _unshape_blocks(xb, int(state["pad_len"]), int(shape[1]))
 
@@ -167,11 +179,11 @@ class KIVIQuantizer(KVQuantizer):
         def bytes_for_tensor(tensor_state: Dict[str, Any]) -> int:
             q = tensor_state["q"]
             scale = tensor_state["scale"]
-            zp = tensor_state["zp"]
+            zero = tensor_state["zero"]
             q_bytes = int(q.numel() * q.element_size()) if tensor_state.get("packed", False) else packed_bytes(
                 int(q.numel()), int(tensor_state.get("bits", self.bits))
             )
-            return q_bytes + int(scale.numel() * scale.element_size()) + int(zp.numel() * zp.element_size())
+            return q_bytes + int(scale.numel() * scale.element_size()) + int(zero.numel() * zero.element_size())
 
         return bytes_for_tensor(state["k"]) + bytes_for_tensor(state["v"])
 
@@ -191,15 +203,15 @@ class KIVIQuantizer(KVQuantizer):
             buffered_k, buffered_v = write_k, write_v
 
         eligible = max(int(buffered_k.shape[1]) - self.residual_length, 0)
-        full_length = (eligible // self.block_size) * self.block_size
+        full_length = (eligible // self.key_group_size) * self.key_group_size
         tensor_dtype = meta.get("tensor_dtype", write_k.dtype)
-        for start in range(0, full_length, self.block_size):
-            end = start + self.block_size
+        for start in range(0, full_length, self.key_group_size):
+            end = start + self.key_group_size
             k_state = self._quantize_keys(buffered_k[:, start:end])
             v_state = self._quantize_values(buffered_v[:, start:end])
             k_state["tensor_dtype"] = tensor_dtype
             v_state["tensor_dtype"] = tensor_dtype
-            append_segment(state, k_state, v_state, self.block_size)
+            append_segment(state, k_state, v_state, self.key_group_size)
 
         state["residual_k"] = buffered_k[:, full_length:].contiguous()
         state["residual_v"] = buffered_v[:, full_length:].contiguous()
@@ -355,13 +367,13 @@ class KIVIQuantizer(KVQuantizer):
     ) -> int:
         active_tokens = max(int(active_tokens), 0)
         eligible = max(active_tokens - self.residual_length, 0)
-        quantized_tokens = (eligible // self.block_size) * self.block_size
-        num_blocks = quantized_tokens // self.block_size
+        quantized_tokens = (eligible // self.key_group_size) * self.key_group_size
+        num_blocks = quantized_tokens // self.key_group_size
         q_values = batch_size * quantized_tokens * num_heads * head_dim
         key_scale_values = batch_size * num_blocks * num_heads * head_dim
         value_group_size = self._resolve_value_group_size(head_dim)
         value_groups = head_dim // value_group_size
-        value_scale_values = batch_size * num_blocks * self.block_size * num_heads * value_groups
+        value_scale_values = batch_size * num_blocks * self.key_group_size * num_heads * value_groups
         key_bytes = packed_bytes(q_values, self.key_bits) + key_scale_values * 2 + key_scale_values * 2
         value_bytes = packed_bytes(q_values, self.value_bits) + value_scale_values * 2 + value_scale_values * 2
         bf16_residual = (active_tokens - quantized_tokens) * batch_size * num_heads * head_dim * 2 * 2

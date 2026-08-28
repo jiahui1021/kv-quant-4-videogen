@@ -33,6 +33,7 @@ def shared_quantizer_class(method: str):
         "RTN": ("rtn", "RTNQuantizer"),
         "KIVI": ("kivi", "KIVIQuantizer"),
         "QUAROT_KV": ("quarot_kv", "QuaRotKVQuantizer"),
+        "HADAMARD_K": ("hadamard_k", "HadamardKQuantizer"),
     }
     try:
         module_name, class_name = class_names[method.upper()]
@@ -53,7 +54,14 @@ def create_shared_quantizer(
     **kwargs: Any,
 ):
     """Create RTN/KIVI/QuaRot from the repository-level implementation."""
-    supported = {"residual_length", "value_group_size", "channel_group_size"}
+    supported = {
+        "residual_length",
+        "key_group_size",
+        "value_group_size",
+        "channel_group_size",
+        "asym",
+        "clip_ratio",
+    }
     unsupported = set(kwargs) - supported
     if unsupported:
         names = ", ".join(sorted(unsupported))
@@ -67,6 +75,9 @@ def create_shared_quantizer(
         value_bits=value_bits,
         name=name,
         residual_length=kwargs.get("residual_length"),
+        key_group_size=kwargs.get("key_group_size"),
         value_group_size=kwargs.get("value_group_size"),
         channel_group_size=kwargs.get("channel_group_size"),
+        asym=kwargs.get("asym"),
+        clip_ratio=kwargs.get("clip_ratio"),
     )

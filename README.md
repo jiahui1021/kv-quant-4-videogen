@@ -1,6 +1,6 @@
 # KV Quantization for LongCat and Causal-Forcing
 
-This repository provides one shared implementation of KV-cache quantization for LongCat and Causal-Forcing. The shared baselines are RTN, KIVI, and KV-only QuaRot; Causal-Forcing additionally exposes the official QVG INT2 and INT4 baselines.
+This repository provides one shared implementation of KV-cache quantization for LongCat and Causal-Forcing. The shared baselines are RTN, KIVI, and KV-only QuaRot (ported from `spcl/QuaRot`); Causal-Forcing additionally exposes the official QVG INT2 and INT4 baselines.
 
 [中文说明](README.zh-CN.md)
 
@@ -9,10 +9,31 @@ This repository provides one shared implementation of KV-cache quantization for 
 | Method | Bits | Description |
 |---|---:|---|
 | `BF16` | 16 | Full-precision KV cache |
-| `RTN_INT4` / `RTN_INT2` | 4 / 2 | Round-to-nearest symmetric quantization |
-| `KIVI_INT4` / `KIVI_INT2` | 4 / 2 | KIVI-style asymmetric key/value quantization |
-| `QUAROT_KV_INT4` / `QUAROT_KV_INT2` | 4 / 2 | Hadamard rotation followed by KV quantization |
+| `RTN_INT4` / `RTN_INT2` | 4 / 2 | Round-to-nearest symmetric quantization, per token/head over channel groups |
+| `KIVI_INT4` / `KIVI_INT2` | 4 / 2 | KIVI-style asymmetric quantization: keys per channel over token groups, values per token |
+| `QUAROT_KV_INT4` / `QUAROT_KV_INT2` | 4 / 2 | KV-only QuaRot: shared post-RoPE Hadamard on Q/K, head-sized Hadamard on V undone on the attention output, symmetric per-token quantization |
+| `HADAMARD_K_INT4` / `HADAMARD_K_INT2` | 4 / 2 | QuaRot with the V rotation removed; a K-only ablation, not a baseline |
 | `QVG_INT2` / `QVG_INT4` | 2 / 4 | Official Quant-VideoGen semantic smoothing + progressive residual quantization (Causal-Forcing only) |
+
+Each baseline follows its own reference rather than a common quantizer: RTN
+and QuaRot are symmetric (QuaRot's `--k_asym`/`--v_asym` default to off) while
+KIVI is asymmetric, and QuaRot's group is one `head_dim` (its `QKRotationWrapper`
+accepts only token-wise or `head_dim`-wise groups) while RTN's is `block_size`.
+Set `--block_size 128` to compare RTN and QuaRot at matched granularity.
+
+QuaRot needs post-RoPE keys, so Causal-Forcing routes it to its own
+`_attention_with_quarot_cache` path instead of the shared pre-RoPE cache.
+
+QuaRot's two range knobs are exposed as `--kv_asym` (upstream `--k_asym`/`--v_asym`)
+and `--kv_clip_ratio` (upstream `--k_clip_ratio`/`--v_clip_ratio`), plus
+`--kv_channel_group_size` for the token-wise (`-1`) group. They apply to the
+rotated backends only; RTN and KIVI reject them instead of ignoring them.
+
+At INT2 the defaults are a poor fit: the symmetric absmax step equals the group
+maximum, so only three of four codes are reachable and most channels round to
+zero. `--kv_asym --kv_clip_ratio 0.5` recovers most of that loss. Upstream
+QuaRot ships no 2-bit path at all (its packing and CUDA kernels are `i4` only),
+so any INT2 QuaRot row is an extrapolation and should say so.
 
 The shared quantizers use `block_size=16` by default. QVG keeps the official
 `quant_block_size=64` and its own eight-chunk schedule. LongCat and

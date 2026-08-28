@@ -18,10 +18,9 @@ from .incremental import (
     recompute_counts,
     state_device,
     state_memory_bytes,
-    tensor_bytes,
 )
 from .packing import packed_bytes
-from .utils import _reshape_blocks, _unshape_blocks, dequantize_sym, quantize_sym, timed
+from .utils import dequantize_sym, quantize_sym, reshape_channel_groups, timed
 
 
 class RTNQuantizer(KVQuantizer):
@@ -34,23 +33,30 @@ class RTNQuantizer(KVQuantizer):
         key_bits: int | None = None,
         value_bits: int | None = None,
         name: str | None = None,
+        channel_group_size: int | None = None,
     ) -> None:
         key_bits = bits if key_bits is None else key_bits
         value_bits = bits if value_bits is None else value_bits
+        channel_group_size = block_size if channel_group_size is None else int(channel_group_size)
+        if channel_group_size <= 0:
+            raise ValueError("channel_group_size must be > 0")
         resolved_name = name or (
             f"RTN_INT{bits}" if key_bits == value_bits == bits else f"RTN_K{key_bits}_V{value_bits}"
         )
         super().__init__(
             bits=bits,
-            block_size=block_size,
+            # ``block_size`` remains a backwards-compatible CLI spelling for
+            # RTN's channel group size. It has no sequence-block meaning.
+            block_size=channel_group_size,
             name=resolved_name,
             key_bits=key_bits,
             value_bits=value_bits,
         )
+        self.channel_group_size = channel_group_size
 
     def _quantize_tensor(self, x: torch.Tensor, bits: int) -> Dict[str, Any]:
-        xb, pad_len = _reshape_blocks(x, self.block_size)
-        q, scale = quantize_sym(xb, bits=bits, reduce_dims=(2,))
+        xg = reshape_channel_groups(x, self.channel_group_size)
+        q, scale = quantize_sym(xg, bits=bits, reduce_dims=(-1,))
         return {
             "q": pack_bits(q, bits, signed=True),
             "q_shape": tuple(q.shape),
@@ -58,10 +64,10 @@ class RTNQuantizer(KVQuantizer):
             "packed": True,
             "signed": True,
             "scale": scale,
-            "pad_len": pad_len,
             "orig_shape": tuple(x.shape),
             "bits": bits,
-            "block_size": self.block_size,
+            "channel_group_size": self.channel_group_size,
+            "axis": "token_head_channel_group",
             "tensor_dtype": x.dtype,
         }
 
@@ -76,8 +82,8 @@ class RTNQuantizer(KVQuantizer):
                 signed=bool(state.get("signed", True)),
             )
         dtype = state.get("tensor_dtype", torch.bfloat16)
-        x = dequantize_sym(q, state["scale"], dtype=dtype)
-        return _unshape_blocks(x, int(state["pad_len"]), int(state["orig_shape"][1]))
+        xg = dequantize_sym(q, state["scale"], dtype=dtype)
+        return xg.reshape(tuple(int(dim) for dim in state["orig_shape"]))
 
     def _segment_memory_bytes(self, state: Dict[str, Any]) -> int:
         def bytes_for_tensor(tensor_state: Dict[str, Any]) -> int:
@@ -97,31 +103,17 @@ class RTNQuantizer(KVQuantizer):
         write_v: torch.Tensor,
         meta: Dict[str, Any],
     ) -> None:
-        residual_k = state.get("residual_k")
-        residual_v = state.get("residual_v")
-        if isinstance(residual_k, torch.Tensor) and residual_k.shape[1] > 0:
-            buffered_k = torch.cat((residual_k, write_k), dim=1)
-            buffered_v = torch.cat((residual_v, write_v), dim=1)
-        else:
-            buffered_k, buffered_v = write_k, write_v
-
-        full_length = (int(buffered_k.shape[1]) // self.block_size) * self.block_size
+        if write_k.shape[1] == 0:
+            return
         tensor_dtype = meta.get("tensor_dtype", write_k.dtype)
-        for start in range(0, full_length, self.block_size):
-            end = start + self.block_size
-            k_state = self._quantize_tensor(buffered_k[:, start:end], self.key_bits)
-            v_state = self._quantize_tensor(buffered_v[:, start:end], self.value_bits)
-            k_state["tensor_dtype"] = tensor_dtype
-            v_state["tensor_dtype"] = tensor_dtype
-            append_segment(state, k_state, v_state, self.block_size)
-
-        state["residual_k"] = buffered_k[:, full_length:].contiguous()
-        state["residual_v"] = buffered_v[:, full_length:].contiguous()
+        k_state = self._quantize_tensor(write_k, self.key_bits)
+        v_state = self._quantize_tensor(write_v, self.value_bits)
+        k_state["tensor_dtype"] = tensor_dtype
+        v_state["tensor_dtype"] = tensor_dtype
+        append_segment(state, k_state, v_state, int(write_k.shape[1]))
 
     def init_state(self, meta: Dict[str, Any] | None = None) -> Dict[str, Any]:
-        state = new_state(meta)
-        state["residual_length"] = 0
-        return state
+        return new_state(meta)
 
     def append_kv(
         self,
@@ -249,11 +241,18 @@ class RTNQuantizer(KVQuantizer):
         head_dim: int,
     ) -> int:
         active_tokens = max(int(active_tokens), 0)
-        full_tokens = (active_tokens // self.block_size) * self.block_size
-        num_blocks = full_tokens // self.block_size
-        q_values = batch_size * num_blocks * self.block_size * num_heads * head_dim
-        scale_values = batch_size * num_blocks * num_heads * head_dim
+        if head_dim % self.channel_group_size:
+            raise ValueError(
+                f"head_dim={head_dim} must be divisible by "
+                f"channel_group_size={self.channel_group_size}"
+            )
+        q_values = batch_size * active_tokens * num_heads * head_dim
+        scale_values = (
+            batch_size
+            * active_tokens
+            * num_heads
+            * (head_dim // self.channel_group_size)
+        )
         key_bytes = packed_bytes(q_values, self.key_bits) + scale_values * 2
         value_bytes = packed_bytes(q_values, self.value_bits) + scale_values * 2
-        residual_bytes = (active_tokens - full_tokens) * batch_size * num_heads * head_dim * 2 * 2
-        return int(key_bytes + value_bytes + residual_bytes)
+        return int(key_bytes + value_bytes)

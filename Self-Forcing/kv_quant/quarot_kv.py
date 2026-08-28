@@ -1,4 +1,4 @@
-"""Compatibility import for the repository-level QuaRot KV quantizer."""
+"""KV-cache-only QuaRot, loaded from the repository-level implementation."""
 
 from .shared import shared_quantizer_class
 

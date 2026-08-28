@@ -250,7 +250,13 @@ def generate(args):
         cp_split_hw,
         enable_compile,
     )
-    method_name, quantizer = parse_method(args.method, block_size=args.block_size)
+    method_name, quantizer = parse_method(
+        args.method,
+        block_size=args.block_size,
+        channel_group_size=args.kv_channel_group_size,
+        asym=args.kv_asym or None,
+        clip_ratio=args.kv_clip_ratio,
+    )
     if quantizer is not None:
         quantizer.set_timing_enabled(args.profile_quant_timing)
     if method_name != "BF16" and args.quant_type != "none":
@@ -870,6 +876,32 @@ def _parse_args():
         type=int,
         default=16,
         help="Sequence block size for shared RTN/KIVI/QuaRot KV quantization",
+    )
+    quant_group.add_argument(
+        "--kv_channel_group_size",
+        type=int,
+        default=None,
+        help=(
+            "Quantization group size in channels. QuaRot accepts only -1 "
+            "(token-wise) or head_dim; RTN/KIVI use --block_size instead"
+        ),
+    )
+    quant_group.add_argument(
+        "--kv_asym",
+        action="store_true",
+        help=(
+            "QuaRot only: asymmetric KV quantization (--k_asym/--v_asym "
+            "upstream, off by default)"
+        ),
+    )
+    quant_group.add_argument(
+        "--kv_clip_ratio",
+        type=float,
+        default=None,
+        help=(
+            "QuaRot only: shrink the quantization range (--k_clip_ratio "
+            "upstream, 1.0 by default)"
+        ),
     )
     quant_group.add_argument(
         "--profile_quant_timing",

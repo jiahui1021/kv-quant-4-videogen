@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Static RTN/KIVI/QuaRot checks; this script never loads a video model."""
+"""Static RTN/KIVI/Hadamard-K checks; this script never loads a video model."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from pathlib import Path
 import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(REPO_ROOT) not in sys.path:
+if sys.path[0] != str(REPO_ROOT):
     sys.path.insert(0, str(REPO_ROOT))
 
 from kv_quant.bitpack import unpack_bits
@@ -49,7 +49,7 @@ def _codebook(tensor_state: dict) -> list[int]:
 
 def _append_invariance(method: str, bits: int, block_size: int, seed: int) -> dict:
     torch.manual_seed(seed)
-    attention_space = method == "QUAROT_KV"
+    attention_space = method == "HADAMARD_K"
     quantizer = create_quantizer(
         method,
         bits=bits,
@@ -124,7 +124,7 @@ def run(seed: int, block_size: int) -> dict:
     torch.manual_seed(seed)
     k = torch.randn(2, 32, 3, 16, dtype=torch.bfloat16)
     v = torch.randn_like(k)
-    methods = ("RTN", "KIVI", "QUAROT_KV")
+    methods = ("RTN", "KIVI", "HADAMARD_K")
     result = {"append_invariance": [], "reconstruction": {}}
     for method in methods:
         result["append_invariance"].append(_append_invariance(method, 4, block_size, seed + 1))
@@ -135,7 +135,7 @@ def run(seed: int, block_size: int) -> dict:
             raise AssertionError(f"INT4 must reconstruct better than INT2 for {method}: {rows}")
         result["reconstruction"][method] = rows
 
-    quantizer = create_quantizer("QUAROT_KV", bits=4, block_size=block_size)
+    quantizer = create_quantizer("HADAMARD_K", bits=4, block_size=block_size)
     q = torch.randn(1, 5, 3, 16, dtype=torch.float32)
     key = torch.randn_like(q)
     rotated_q, rotated_key = quantizer.prepare_attention_qk(q, key)
@@ -143,8 +143,8 @@ def run(seed: int, block_size: int) -> dict:
     rotated = torch.matmul(rotated_q, rotated_key.transpose(-1, -2))
     max_abs_error = float((original - rotated).abs().max())
     if max_abs_error >= 1e-5:
-        raise AssertionError(f"QuaRot BF16 rotation equivalence failed: max_abs_error={max_abs_error}")
-    result["quarot_rotation_equivalence"] = {
+        raise AssertionError(f"Hadamard-K BF16 rotation equivalence failed: max_abs_error={max_abs_error}")
+    result["hadamard_k_rotation_equivalence"] = {
         "max_abs_error": max_abs_error,
         "cosine": float(torch.nn.functional.cosine_similarity(original.flatten(), rotated.flatten(), dim=0)),
     }
