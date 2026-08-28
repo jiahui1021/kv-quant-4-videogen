@@ -42,6 +42,7 @@ from qvg_runtime import (
     qvg_memory_breakdown,
     qvg_resident_memory_bytes,
     reset_qvg_cache,
+    qvg_span_for_block,
 )
 
 parser = argparse.ArgumentParser()
@@ -74,6 +75,12 @@ parser.add_argument(
     help="Record optional quantize/dequantize CUDA-event breakdowns",
 )
 parser.add_argument("--qvg_quant_factor", type=int, default=8)
+parser.add_argument(
+    "--span_frames",
+    type=int,
+    default=None,
+    help="Formal QVG compression span in latent frames",
+)
 parser.add_argument("--qvg_num_k_centroids", type=int, default=256)
 parser.add_argument("--qvg_num_v_centroids", type=int, default=256)
 parser.add_argument("--qvg_kmeans_max_iters", type=int, default=2)
@@ -133,6 +140,34 @@ if latent_frames % num_frame_per_block:
         "formal Causal-Forcing workload"
     )
 qvg_enabled = args.method.startswith("QVG_")
+compression_span_frames = None
+if qvg_enabled:
+    compression_span_frames = int(args.qvg_quant_factor * num_frame_per_block)
+    if args.span_frames is not None:
+        if args.span_frames <= 0:
+            raise ValueError("span_frames must be a positive integer")
+        if int(args.span_frames) != compression_span_frames:
+            raise ValueError(
+                "span_frames must equal qvg_quant_factor * num_frame_per_block "
+                f"({compression_span_frames} for this configuration); got "
+                f"{args.span_frames}"
+            )
+        if num_frame_per_block == 3 and args.qvg_quant_factor == 8:
+            expected_schedule = ((0, 24), (24, 48), (48, 72))
+            observed_schedule = tuple(
+                qvg_span_for_block(
+                    block_index,
+                    [3] * 25,
+                    1,
+                    quant_factor=8,
+                )
+                for block_index in (8, 16, 24)
+            )
+            if observed_schedule != expected_schedule:
+                raise AssertionError(
+                    "chunkwise QVG schedule drifted: "
+                    f"expected {expected_schedule}, got {observed_schedule}"
+                )
 effective_local_attn_size = int(
     args.local_attn_size
     if args.local_attn_size is not None
@@ -151,9 +186,7 @@ benchmark_config = {
         else "windowed"
     ),
     "compression_span_frames": (
-        int(args.qvg_quant_factor * num_frame_per_block)
-        if qvg_enabled
-        else None
+        compression_span_frames
     ),
     "seed": int(args.seed),
     "checkpoint": str(Path(args.checkpoint_path).expanduser().resolve()),
@@ -431,7 +464,7 @@ def _write_metrics(
 
 
 for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
-    idx = batch_data['idx'].item()
+    idx = int(batch_data['idx'].item())
 
     if isinstance(batch_data, dict):
         batch = batch_data
@@ -440,32 +473,31 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
 
     all_video = []
     num_generated_frames = 0  # Number of generated (latent) frames
-    
-    
+
+    output_path = os.path.join(args.output_folder, f'{idx}_0.mp4')
+    if os.path.exists(output_path):
+        print('Video has been generated. Pass!')
+        continue
+
+    prompt_seed = int(args.seed) + int(idx) * 1_000_003
+
     if args.i2v:
         assert config.num_frame_per_block == 1, "Current I2V only supports the frame-wise model."
         # For image-to-video, batch contains image and caption
         prompt = batch['prompts'][0]  # Get caption from batch
-        output_path = os.path.join(args.output_folder, f'{prompt[:100]}.mp4')
-        if os.path.exists(output_path):
-            print('Video has been generated. Pass!')
-            continue
         # Process the image
         image = batch['image'].squeeze(0).unsqueeze(0).unsqueeze(2).to(device=device, dtype=torch.bfloat16)
 
         # Encode the input image as the first latent
         initial_latent = pipeline.vae.encode_to_latent(image).to(device=device, dtype=torch.bfloat16)
         prompts = [prompt] 
+        set_seed(prompt_seed)
         sampled_noise = torch.randn(
             [1, args.num_output_frames - 1, 16, 60, 104], device=device, dtype=torch.bfloat16
         )
     else:
         # For text-to-video, batch is just the text prompt
         prompt = batch['prompts'][0]
-        output_path = os.path.join(args.output_folder, f'{prompt[:100]}.mp4')
-        if os.path.exists(output_path):
-            print('Video has been generated. Pass!')
-            continue
         extended_prompt = batch['extended_prompts'][0] if 'extended_prompts' in batch else None
         if extended_prompt is not None:
             prompts = [extended_prompt] 
@@ -473,6 +505,7 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
             prompts = [prompt] 
 
         initial_latent = None
+        set_seed(prompt_seed)
         sampled_noise = torch.randn(
             [1, args.num_output_frames, 16, 60, 104], device=device, dtype=torch.bfloat16
         )
@@ -516,7 +549,6 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
     # Clear VAE cache
     pipeline.vae.model.clear_cache()
 
-    output_path = os.path.join(args.output_folder, f'{prompt[:100]}.mp4')
     write_video(output_path, video[0], fps=16)
     _write_metrics(
         prompt_idx=idx,

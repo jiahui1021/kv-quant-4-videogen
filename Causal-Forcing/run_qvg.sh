@@ -7,6 +7,7 @@ CONFIG_PATH="${CONFIG_PATH:-Causal-Forcing/configs/causal_forcing_dmd_chunkwise.
 
 METHOD="${METHOD:-QVG_INT2}"
 NUM_OUTPUT_FRAMES="${NUM_OUTPUT_FRAMES:-180}"
+SPAN_FRAMES="${SPAN_FRAMES:-24}"
 LOCAL_ATTN_SIZE="${LOCAL_ATTN_SIZE:-180}"
 RETAIN_FINAL_CACHE="${RETAIN_FINAL_CACHE:-1}"
 USE_EMA="${USE_EMA:-0}"
@@ -24,6 +25,10 @@ if [[ "$USE_EMA" != 0 && "$USE_EMA" != 1 ]]; then
 fi
 if [[ "$PROFILE_QUANT_TIMING" != 0 && "$PROFILE_QUANT_TIMING" != 1 ]]; then
   echo "PROFILE_QUANT_TIMING must be 0 or 1" >&2
+  exit 2
+fi
+if [[ ! "$SPAN_FRAMES" =~ ^[1-9][0-9]*$ ]]; then
+  echo "SPAN_FRAMES must be a positive integer" >&2
   exit 2
 fi
 export CAUSAL_FORCING_BENCHMARK="${CAUSAL_FORCING_BENCHMARK:-1}"
@@ -48,6 +53,7 @@ fi
   --local_attn_size "${LOCAL_ATTN_SIZE}" \
   --method "${METHOD}" \
   --qvg_quant_factor 8 \
+  --span_frames "${SPAN_FRAMES}" \
   --qvg_num_k_centroids 256 \
   --qvg_num_v_centroids 256 \
   --qvg_kmeans_max_iters 2 \
