@@ -160,7 +160,13 @@ class Attention(nn.Module):
         with time_logging_decorator("QK Norm", logging_level=3):
             q, k = self.q_norm(q), self.k_norm(k)
 
-            if return_kv:
+            # QuaRot quantizes post-RoPE keys, so its cache is captured after
+            # rope_3d below.  Every other method keeps the pre-RoPE cache that
+            # ``forward_with_kv_cache`` re-ropes on read.
+            cache_post_rope = bool(
+                getattr(self.kv_quantizer, "requires_special_attention_backend", False)
+            )
+            if return_kv and not cache_post_rope:
                 k_cache, v_cache = k.clone(), v.clone()
 
         with time_logging_decorator("Rope 3D", logging_level=3):
@@ -190,6 +196,11 @@ class Attention(nn.Module):
             #         )
 
             q, k = self.rope_3d(q, k, shape)
+            if return_kv and cache_post_rope:
+                # The condition cache always occupies frames 0..num_cond-1,
+                # both here and inside ``forward_with_kv_cache``, so its RoPE
+                # phase is fixed and safe to bake in.
+                k_cache, v_cache = k.clone(), v.clone()
             # print("Called at Layer: ", self.layer_idx)
 
             # if self.layer_idx % 4 == 0:
@@ -285,18 +296,38 @@ class Attention(nn.Module):
                 k_cache = k_cache.repeat(B, 1, 1, 1)
                 v_cache = v_cache.repeat(B, 1, 1, 1)
 
+            attention_space = bool(kv_cache.get("attention_space")) if is_shared_quant_cache(kv_cache) else False
+
             if num_cond_latents is not None and num_cond_latents > 0:
                 k_full = torch.cat([k_cache, k], dim=2).contiguous()
                 v_full = torch.cat([v_cache, v], dim=2).contiguous()
                 q_padding = torch.cat(
                     [torch.empty_like(k_cache), q], dim=2
                 ).contiguous()
-                q_padding, k_full = self.rope_3d(
+                q_padding, k_roped = self.rope_3d(
                     q_padding, k_full, (T + num_cond_latents, H, W)
                 )
                 q = q_padding[:, :, -N:].contiguous()
+                if attention_space:
+                    # ``k_cache`` is already post-RoPE and rotated, so the
+                    # freshly re-roped copy of it is discarded and only the
+                    # new keys are taken from ``k_roped``.  Q joins the same
+                    # rotated basis and V is rotated to match the cache.
+                    cached_len = k_cache.shape[2]
+                    q, new_k = self.kv_quantizer.prepare_attention_qk(
+                        q, k_roped[:, :, cached_len:].contiguous()
+                    )
+                    k_full = torch.cat([k_cache, new_k], dim=2).contiguous()
+                    v_full = torch.cat(
+                        [v_cache, self.kv_quantizer.prepare_value(v)], dim=2
+                    ).contiguous()
+                else:
+                    k_full = k_roped
 
         x = self._process_attn(q, k_full, v_full, shape, timestep_int=timestep_int)
+        if attention_space:
+            # Stands in for the inverse Hadamard QuaRot folds into o_proj.
+            x = self.kv_quantizer.restore_attention_output(x)
 
         with time_logging_decorator("Output Projection", logging_level=3):
             x_output_shape = (B, N, C)

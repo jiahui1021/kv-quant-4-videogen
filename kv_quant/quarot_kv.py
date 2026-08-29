@@ -352,7 +352,10 @@ class QuaRotKVQuantizer(KVQuantizer):
             state = {
                 "k": k_state,
                 "v": v_state,
-                "attention_space": already_rotated,
+                # A caller may ask the one-shot cache to stay rotated without
+                # having rotated the input itself, which is what LongCat's
+                # condition cache does.  This mirrors ``append_kv``.
+                "attention_space": bool(meta.get("attention_space", already_rotated)),
             }
         self.stats.record_quantize(timer)
         self.stats.quantize_calls += 1

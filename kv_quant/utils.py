@@ -90,7 +90,10 @@ def fwht_last_dim(x: torch.Tensor) -> torch.Tensor:
     if n & (n - 1) != 0:
         raise ValueError("Last dimension must be power of two for Hadamard transform.")
     x_dtype = x.dtype
-    y = x.float()
+    # QuaRot's ``.float()`` is always an upcast because it only ever sees
+    # fp16/bf16.  Promote instead, so a float64 caller is not silently
+    # rounded down to float32 by the butterfly.
+    y = x.to(torch.promote_types(x_dtype, torch.float32))
     work_shape = y.shape
     h = 1
     while h < n:

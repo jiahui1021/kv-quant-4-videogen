@@ -38,16 +38,22 @@ def encode_longcat_kv(k: torch.Tensor, v: torch.Tensor, quantizer) -> dict[str, 
     if k.shape != v.shape:
         raise ValueError(f"K/V shapes must match, got {tuple(k.shape)} and {tuple(v.shape)}")
     dtype = k.dtype
+    # QuaRot keeps the cache in the rotated attention space; the attention
+    # module rotates Q to match and undoes the V rotation on its output.
+    attention_space = bool(
+        getattr(quantizer, "requires_special_attention_backend", False)
+    )
     state = quantizer.quantize_kv(
         longcat_to_shared(k),
         longcat_to_shared(v),
-        meta={"tensor_dtype": dtype},
+        meta={"tensor_dtype": dtype, "attention_space": attention_space},
     )
     return {
         "format": FORMAT_NAME,
         "state": state,
         "dtype": dtype,
         "shape": tuple(k.shape),
+        "attention_space": attention_space,
     }
 
 

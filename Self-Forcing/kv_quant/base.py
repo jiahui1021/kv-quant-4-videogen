@@ -57,7 +57,6 @@ class KVQuantizer(ABC):
     def memory_bytes(self, state: Dict[str, Any]) -> int:
         raise NotImplementedError
 
-    @abstractmethod
     def estimate_active_kv_bytes(
         self,
         active_tokens: int,
@@ -65,4 +64,19 @@ class KVQuantizer(ABC):
         num_heads: int,
         head_dim: int,
     ) -> int:
-        raise NotImplementedError
+        """Resident bytes for ``active_tokens`` tokens, before any is cached.
+
+        Deliberately not abstract.  The experimental quantizers in this
+        package decide how many tokens survive from the data itself -- the
+        pruning families drop tokens, and the mixed-precision ones split them
+        by a content-dependent mask -- so there is no shape-only answer to
+        give them, and making this abstract stopped every one of them from
+        being constructed at all.  A method that can answer overrides this;
+        one that cannot fails here, where the estimate is actually wanted,
+        instead of at construction time.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not report an active KV-cache size "
+            "estimate; measure it with memory_bytes(state) on a real cache "
+            "instead of predicting it from token counts"
+        )
