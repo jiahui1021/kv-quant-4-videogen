@@ -50,9 +50,9 @@ def create_quantizer(method: str, bits: int | None, block_size: int, **kwargs):
             key_bits=kwargs.get("key_bits"),
             value_bits=kwargs.get("value_bits"),
             name=kwargs.get("name"),
-            residual_length=kwargs.get("residual_length"),
-            value_group_size=kwargs.get("value_group_size"),
             channel_group_size=kwargs.get("channel_group_size"),
+            asym=kwargs.get("asym"),
+            clip_ratio=kwargs.get("clip_ratio"),
         )
     if method == "PRQ":
         from .prq import PRQQuantizer

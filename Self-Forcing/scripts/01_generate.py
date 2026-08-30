@@ -36,6 +36,37 @@ from utils.misc import set_seed
 from demo_utils.memory import DynamicSwapInstaller, get_cuda_free_memory_gb
 
 
+
+def _quarot_kwargs(
+    base: str,
+    channel_group_size: Optional[int],
+    asym: Optional[bool],
+    clip_ratio: Optional[float],
+) -> Dict[str, object]:
+    """QuaRot's range knobs, which RTN and KIVI reject rather than ignore."""
+    requested = {
+        "--kv-channel-group-size": channel_group_size,
+        "--kv-asym": asym or None,
+        "--kv-clip-ratio": clip_ratio,
+    }
+    if base != "QUAROT_KV":
+        named = sorted(flag for flag, value in requested.items() if value is not None)
+        if named:
+            raise ValueError(
+                f"{', '.join(named)} only applies to QUAROT_KV, not {base}; "
+                "passing it here would silently change nothing"
+            )
+        return {}
+    extra: Dict[str, object] = {}
+    if channel_group_size is not None:
+        extra["channel_group_size"] = int(channel_group_size)
+    if asym:
+        extra["asym"] = True
+    if clip_ratio is not None:
+        extra["clip_ratio"] = float(clip_ratio)
+    return extra
+
+
 def parse_method(
     method: str,
     bits: Optional[int],
@@ -74,6 +105,9 @@ def parse_method(
     spatial_max_foreground_ratio: float,
     spatial_target_foreground_ratio: float,
     kivi_residual_length: Optional[int] = None,
+    quarot_channel_group_size: Optional[int] = None,
+    quarot_asym: Optional[bool] = None,
+    quarot_clip_ratio: Optional[float] = None,
 ):
     method = method.upper()
     flowcache_layer_budget_table = load_layer_budget_table(flowcache_layer_budget_path)
@@ -136,6 +170,7 @@ def parse_method(
                 bits=bits,
                 block_size=block_size,
                 residual_length=kivi_residual_length if method == "KIVI" else None,
+                **_quarot_kwargs(method, quarot_channel_group_size, quarot_asym, quarot_clip_ratio),
             )
         if method == "PRQ":
             return f"{method}_INT{bits}", create_quantizer(
@@ -347,6 +382,7 @@ def parse_method(
         bits=parsed_bits,
         block_size=block_size,
         residual_length=kivi_residual_length if base == "KIVI" else None,
+        **_quarot_kwargs(base, quarot_channel_group_size, quarot_asym, quarot_clip_ratio),
     )
 
 
@@ -676,6 +712,9 @@ def run(args: argparse.Namespace) -> None:
         args.spatial_max_foreground_ratio,
         args.spatial_target_foreground_ratio,
         args.kivi_residual_length,
+        quarot_channel_group_size=args.kv_channel_group_size,
+        quarot_asym=args.kv_asym,
+        quarot_clip_ratio=args.kv_clip_ratio,
     )
 
     if quantizer is not None and hasattr(quantizer, "set_timing_enabled"):
@@ -1149,6 +1188,33 @@ def build_parser() -> argparse.ArgumentParser:
         "--bits", type=int, default=None, help="Optional bit-width when using method names RTN/KIVI/QUAROT_KV/PRQ/QAQ/AGE_TIER/TPTQ/FLOWCACHE_HYBRID/FLOWCACHE_ADAPTIVE/FLOWCACHE_PRUNE/FLOWCACHE_SOFT_PRUNE"
     )
     parser.add_argument("--block-size", type=int, default=16)
+    parser.add_argument(
+        "--kv-channel-group-size",
+        type=int,
+        default=None,
+        help=(
+            "QuaRot only: quantization group in channels. The reference accepts "
+            "-1 (token-wise) or head_dim; RTN/KIVI use --block-size instead"
+        ),
+    )
+    parser.add_argument(
+        "--kv-asym",
+        action="store_true",
+        help=(
+            "QuaRot only: asymmetric KV quantization (--k_asym/--v_asym upstream, "
+            "off by default). Worth setting at INT2, where the symmetric range "
+            "leaves only three usable codes"
+        ),
+    )
+    parser.add_argument(
+        "--kv-clip-ratio",
+        type=float,
+        default=None,
+        help=(
+            "QuaRot only: shrink the quantization range (--k_clip_ratio upstream, "
+            "1.0 by default). Trades tail clipping for resolution near zero"
+        ),
+    )
     parser.add_argument(
         "--kivi-residual-length",
         type=int,
