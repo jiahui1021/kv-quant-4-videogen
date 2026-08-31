@@ -205,13 +205,21 @@ class KIVIQuantizer(KVQuantizer):
         eligible = max(int(buffered_k.shape[1]) - self.residual_length, 0)
         full_length = (eligible // self.key_group_size) * self.key_group_size
         tensor_dtype = meta.get("tensor_dtype", write_k.dtype)
-        for start in range(0, full_length, self.key_group_size):
-            end = start + self.key_group_size
-            k_state = self._quantize_keys(buffered_k[:, start:end])
-            v_state = self._quantize_values(buffered_v[:, start:end])
+        if full_length:
+            # One segment for the whole run, not one per group.  ``_reshape_blocks``
+            # inside the two helpers already splits the run into key_group_size
+            # groups and gives each its own scale/min-offset, so quantizing the
+            # run in a single call is bit-identical to a per-group loop.  The
+            # loop mattered only in that it left one segment per 16 tokens, and
+            # ``_materialize_incremental`` walks every segment in Python on every
+            # call -- at Wan's 4680-token blocks that was 292 segments per block
+            # instead of one, which is what made KIVI collapse to minutes per
+            # block while RTN stayed at seconds.
+            k_state = self._quantize_keys(buffered_k[:, :full_length])
+            v_state = self._quantize_values(buffered_v[:, :full_length])
             k_state["tensor_dtype"] = tensor_dtype
             v_state["tensor_dtype"] = tensor_dtype
-            append_segment(state, k_state, v_state, self.key_group_size)
+            append_segment(state, k_state, v_state, full_length)
 
         state["residual_k"] = buffered_k[:, full_length:].contiguous()
         state["residual_v"] = buffered_v[:, full_length:].contiguous()
