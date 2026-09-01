@@ -14,7 +14,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if sys.path[0] != str(REPO_ROOT):
     sys.path.insert(0, str(REPO_ROOT))
 
-from kv_quant.bitpack import unpack_bits
+from kv_quant.bitpack import unpack_bits, unpack_bits_rows
 from kv_quant.factory import create_quantizer
 
 
@@ -37,13 +37,22 @@ def _payload_bytes(state: dict) -> int:
 
 
 def _codebook(tensor_state: dict) -> list[int]:
-    values = unpack_bits(
-        tensor_state["q"],
-        int(tensor_state["bits"]),
-        tensor_state["q_shape"],
-        int(tensor_state["q_numel"]),
-        signed=bool(tensor_state.get("signed", False)),
-    )
+    if tensor_state.get("packed_rows") is not None:
+        values = unpack_bits_rows(
+            tensor_state["q"],
+            int(tensor_state["bits"]),
+            tensor_state["q_shape"],
+            signed=bool(tensor_state.get("signed", False)),
+            row_dims=int(tensor_state["packed_rows"]),
+        )
+    else:
+        values = unpack_bits(
+            tensor_state["q"],
+            int(tensor_state["bits"]),
+            tensor_state["q_shape"],
+            int(tensor_state["q_numel"]),
+            signed=bool(tensor_state.get("signed", False)),
+        )
     return [int(value) for value in torch.unique(values).cpu().tolist()]
 
 
@@ -120,6 +129,107 @@ def _reconstruction(method: str, bits: int, block_size: int, k: torch.Tensor, v:
     }
 
 
+def _kivi_regressions() -> dict:
+    quantizer = create_quantizer(
+        "KIVI",
+        bits=4,
+        block_size=4,
+        residual_length=8,
+        value_group_size=4,
+    )
+    k = torch.randn(1, 12, 1, 4, dtype=torch.bfloat16)
+    state = quantizer.quantize_kv(k, k.clone())
+    expected = {
+        "quantized_k_tokens": 8,
+        "residual_k_tokens": 4,
+        "quantized_v_tokens": 4,
+        "residual_v_tokens": 8,
+    }
+    actual = {
+        "quantized_k_tokens": int(state["quantized_k_tokens"]),
+        "residual_k_tokens": int(state["residual_k"].shape[1]),
+        "quantized_v_tokens": int(state["quantized_v_tokens"]),
+        "residual_v_tokens": int(state["residual_v"].shape[1]),
+    }
+    if actual != expected:
+        raise AssertionError(f"KIVI residual lifecycle mismatch: {actual} != {expected}")
+    estimate = quantizer.estimate_active_kv_bytes(12, 1, 1, 4)
+    resident = quantizer.memory_bytes(state)
+    if estimate != resident:
+        raise AssertionError(f"KIVI byte estimate mismatch: {estimate} != {resident}")
+
+    eviction_quantizer = create_quantizer(
+        "KIVI",
+        bits=4,
+        block_size=3,
+        residual_length=0,
+        value_group_size=3,
+    )
+    eviction_input = torch.randn(1, 6, 1, 3, dtype=torch.bfloat16)
+    eviction_state = eviction_quantizer.quantize_kv(
+        eviction_input,
+        eviction_input.clone(),
+    )
+    removed = eviction_quantizer.evict_prefix(eviction_state, 3)
+    if removed != 3 or eviction_state["num_tokens"] != 3:
+        raise AssertionError(
+            f"KIVI group eviction failed: removed={removed}, "
+            f"remaining={eviction_state['num_tokens']}"
+        )
+
+    high = torch.tensor(
+        [1e5, 1.2e5, 1.5e5, 2e5],
+        dtype=torch.bfloat16,
+    ).reshape(1, 4, 1, 1).repeat(1, 1, 1, 4)
+    overflow_quantizer = create_quantizer(
+        "KIVI",
+        bits=4,
+        block_size=4,
+        residual_length=0,
+        value_group_size=4,
+    )
+    high_state = overflow_quantizer.quantize_kv(high, high.clone())
+    high_hat, _ = overflow_quantizer.dequantize_kv(high_state)
+    if not torch.isfinite(high_hat).all():
+        raise AssertionError("KIVI finite BF16 input reconstructed as inf/nan")
+
+    return {
+        **actual,
+        "resident_bytes": int(resident),
+        "estimated_bytes": int(estimate),
+        "evicted_tokens": int(removed),
+        "remaining_tokens": int(eviction_state["num_tokens"]),
+        "finite_bf16_range": True,
+    }
+
+
+def _self_forcing_patch_regression() -> dict:
+    patch_path = (
+        REPO_ROOT
+        / "Self-Forcing"
+        / "docs"
+        / "patches"
+        / "self_forcing_kv_quant.patch"
+    )
+    text = patch_path.read_text(encoding="utf-8")
+    required = (
+        'cache_k[:, :local_end_index]',
+        'cache_v[:, :local_end_index]',
+        'active_k, active_v = quantizer.dequantize_kv',
+        'cache_k = torch.zeros(',
+    )
+    missing = [snippet for snippet in required if snippet not in text]
+    if missing:
+        raise AssertionError(
+            "Self-Forcing patch does not preserve active-prefix KIVI semantics: "
+            + ", ".join(missing)
+        )
+    return {
+        "compresses_active_prefix_only": True,
+        "restores_dense_work_capacity": True,
+    }
+
+
 def run(seed: int, block_size: int) -> dict:
     torch.manual_seed(seed)
     k = torch.randn(2, 32, 3, 16, dtype=torch.bfloat16)
@@ -148,6 +258,8 @@ def run(seed: int, block_size: int) -> dict:
         "max_abs_error": max_abs_error,
         "cosine": float(torch.nn.functional.cosine_similarity(original.flatten(), rotated.flatten(), dim=0)),
     }
+    result["kivi_regressions"] = _kivi_regressions()
+    result["self_forcing_patch_regression"] = _self_forcing_patch_regression()
     return result
 
 

@@ -198,8 +198,12 @@ class CausalWanSelfAttention(nn.Module):
                     removed = quantizer.evict_prefix(state, requested_eviction)
                 # A partial packed block is intentionally retained.  The
                 # attention slice below still enforces the requested window.
-                if removed == 0:
-                    kv_cache["eviction_slack_tokens"] = int(requested_eviction)
+                if removed < requested_eviction:
+                    kv_cache["eviction_slack_tokens"] = int(
+                        requested_eviction - removed
+                    )
+                else:
+                    kv_cache.pop("eviction_slack_tokens", None)
 
         quantizer.append_kv(
             state,

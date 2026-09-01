@@ -43,6 +43,66 @@ def pack_bits(q: torch.Tensor, bits: int, *, signed: bool) -> torch.Tensor:
     return packed.to(torch.uint8)
 
 
+def pack_bits_rows(
+    q: torch.Tensor,
+    bits: int,
+    *,
+    signed: bool,
+    row_dims: int,
+) -> torch.Tensor:
+    """Pack the trailing dimensions independently for every leading row.
+
+    KIVI has an intrinsic storage boundary for every key sequence group and
+    every value token.  Padding each row independently makes the physical
+    byte count independent of append boundaries and lets eviction slice whole
+    rows without unpacking or re-packing older payloads.
+    """
+    _validate_bits(bits)
+    if q.dtype != torch.int8:
+        raise TypeError(f"Expected an int8 quantization tensor, got dtype={q.dtype}.")
+    if row_dims <= 0 or row_dims >= q.ndim:
+        raise ValueError(
+            f"row_dims must keep between 1 and {q.ndim - 1} leading dimensions, "
+            f"got {row_dims}."
+        )
+
+    leading_shape = tuple(int(dim) for dim in q.shape[:row_dims])
+    values_per_row = 1
+    for dim in q.shape[row_dims:]:
+        values_per_row *= int(dim)
+    rows = q.reshape(-1, values_per_row)
+
+    values_per_byte = 8 // bits
+    value_mask = (1 << bits) - 1
+    offset = (1 << (bits - 1)) if signed else 0
+    values = rows.to(torch.int32) + offset
+    values = values.clamp(0, value_mask)
+
+    row_pad = (-values_per_row) % values_per_byte
+    if row_pad:
+        values = torch.cat(
+            [
+                values,
+                torch.zeros(
+                    values.shape[0],
+                    row_pad,
+                    dtype=values.dtype,
+                    device=values.device,
+                ),
+            ],
+            dim=1,
+        )
+
+    shifts = (
+        torch.arange(values_per_byte, dtype=torch.int32, device=values.device)
+        * bits
+    )
+    packed = (
+        values.reshape(values.shape[0], -1, values_per_byte) << shifts
+    ).sum(dim=-1)
+    return packed.to(torch.uint8).reshape(*leading_shape, packed.shape[-1])
+
+
 def unpack_bits(
     packed: torch.Tensor,
     bits: int,
@@ -83,4 +143,49 @@ def unpack_bits(
     ) * bits
     values = (packed.reshape(-1).to(torch.int32)[:, None] >> shifts) & value_mask
     values = values.reshape(-1)[:numel] - offset
+    return values.to(torch.int8).reshape(shape)
+
+
+def unpack_bits_rows(
+    packed: torch.Tensor,
+    bits: int,
+    shape: Sequence[int],
+    *,
+    signed: bool,
+    row_dims: int,
+) -> torch.Tensor:
+    """Inverse of :func:`pack_bits_rows`."""
+    _validate_bits(bits)
+    if packed.dtype != torch.uint8:
+        raise TypeError(f"Expected a uint8 packed tensor, got dtype={packed.dtype}.")
+    shape = tuple(int(dim) for dim in shape)
+    if row_dims <= 0 or row_dims >= len(shape):
+        raise ValueError(
+            f"row_dims must keep between 1 and {len(shape) - 1} leading dimensions, "
+            f"got {row_dims}."
+        )
+
+    rows = 1
+    for dim in shape[:row_dims]:
+        rows *= dim
+    values_per_row = 1
+    for dim in shape[row_dims:]:
+        values_per_row *= dim
+    values_per_byte = 8 // bits
+    required_row_bytes = (values_per_row + values_per_byte - 1) // values_per_byte
+    if packed.numel() != rows * required_row_bytes:
+        raise ValueError(
+            f"Packed row tensor has {packed.numel()} bytes, but "
+            f"{rows * required_row_bytes} are required for shape={shape}."
+        )
+
+    value_mask = (1 << bits) - 1
+    offset = (1 << (bits - 1)) if signed else 0
+    shifts = (
+        torch.arange(values_per_byte, dtype=torch.int32, device=packed.device)
+        * bits
+    )
+    packed_rows = packed.reshape(rows, required_row_bytes).to(torch.int32)
+    values = (packed_rows[:, :, None] >> shifts) & value_mask
+    values = values.reshape(rows, -1)[:, :values_per_row] - offset
     return values.to(torch.int8).reshape(shape)

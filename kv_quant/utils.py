@@ -44,14 +44,20 @@ def reshape_channel_groups(x: torch.Tensor, group_size: int) -> torch.Tensor:
     return x.reshape(b, l, h, d // group_size, group_size)
 
 
-def quantize_asym(x: torch.Tensor, bits: int, reduce_dims: Tuple[int, ...]):
+def quantize_asym(
+    x: torch.Tensor,
+    bits: int,
+    reduce_dims: Tuple[int, ...],
+    *,
+    parameter_dtype: torch.dtype = torch.float16,
+):
     qmin, qmax = 0, (1 << bits) - 1
     x_min = x.amin(dim=reduce_dims, keepdim=True)
     x_max = x.amax(dim=reduce_dims, keepdim=True)
     scale = ((x_max - x_min) / max(qmax - qmin, 1)).clamp_min(EPS)
     zero = x_min
     q = torch.round((x - zero) / scale).clamp(qmin, qmax).to(torch.int8)
-    return q, scale.to(torch.float16), zero.to(torch.float16)
+    return q, scale.to(parameter_dtype), zero.to(parameter_dtype)
 
 
 def dequantize_asym(

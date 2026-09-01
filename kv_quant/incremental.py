@@ -42,8 +42,10 @@ def new_state(meta: Dict[str, Any] | None = None) -> Dict[str, Any]:
         "num_tokens": 0,
         "shape": shape,
         "tensor_dtype": meta.get("tensor_dtype"),
+        "device": meta.get("device"),
         "write_start": None,
         "write_end": None,
+        "committed_end": None,
         "attention_space": bool(meta.get("attention_space", False)),
     }
 
@@ -173,6 +175,18 @@ def prepare_write(
     old_write_k = state.get("write_k")
     old_write_v = state.get("write_v")
 
+    committed_end = state.get("committed_end")
+    if (
+        not isinstance(old_write_k, torch.Tensor)
+        and start is not None
+        and committed_end is not None
+        and int(start) < int(committed_end)
+    ):
+        raise ValueError(
+            "Cannot overwrite an already committed KV-cache range; "
+            "only the current mutable write range may be replaced"
+        )
+
     if isinstance(old_write_k, torch.Tensor):
         if _same_range(state, start, end):
             if old_write_k.shape != new_k.shape or old_write_v.shape != new_v.shape:
@@ -192,12 +206,15 @@ def prepare_write(
                 "only the current write range may be replaced"
             )
         commit(state, old_write_k, old_write_v, meta)
+        if state.get("write_end") is not None:
+            state["committed_end"] = int(state["write_end"])
         state["write_k"] = None
         state["write_v"] = None
 
     state["write_k"] = new_k
     state["write_v"] = new_v
     state["tensor_dtype"] = meta.get("tensor_dtype", new_k.dtype)
+    state["device"] = new_k.device
     if start is not None:
         state["write_start"] = int(start)
     else:
@@ -237,7 +254,7 @@ def _empty_from_state(
     if dtype is None:
         dtype = meta.get("tensor_dtype") or state.get("tensor_dtype") or torch.bfloat16
     if device is None:
-        device = meta.get("device", "cpu")
+        device = meta.get("device") or state.get("device") or "cpu"
     return torch.empty(shape, dtype=dtype, device=device)
 
 
@@ -284,7 +301,8 @@ def state_device(state: Dict[str, Any]) -> torch.device:
         value = segment["k"].get("q")
         if isinstance(value, torch.Tensor):
             return value.device
-    return torch.device("cpu")
+    configured = state.get("device")
+    return torch.device(configured) if configured is not None else torch.device("cpu")
 
 
 def evict_prefix(state: Dict[str, Any], requested_tokens: int) -> int:

@@ -283,6 +283,8 @@ class QuaRotKVQuantizer(KVQuantizer):
         meta.setdefault("tensor_dtype", write_k.dtype)
         with timed(write_k.device, enabled=self.stats.timing_enabled) as timer:
             self._commit_write(state, write_k, write_v, meta)
+        if state.get("write_end") is not None:
+            state["committed_end"] = int(state["write_end"])
         state["write_k"] = None
         state["write_v"] = None
         recompute_counts(state)

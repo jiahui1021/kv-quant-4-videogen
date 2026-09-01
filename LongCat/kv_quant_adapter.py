@@ -46,7 +46,11 @@ def encode_longcat_kv(k: torch.Tensor, v: torch.Tensor, quantizer) -> dict[str, 
     state = quantizer.quantize_kv(
         longcat_to_shared(k),
         longcat_to_shared(v),
-        meta={"tensor_dtype": dtype, "attention_space": attention_space},
+        meta={
+            "tensor_dtype": dtype,
+            "device": k.device,
+            "attention_space": attention_space,
+        },
     )
     return {
         "format": FORMAT_NAME,

@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SF_DIR="${ROOT_DIR}/third_party/Self-Forcing"
 PATCH_FILE="${ROOT_DIR}/docs/patches/self_forcing_kv_quant.patch"
+UPGRADE_PATCH_FILE="${ROOT_DIR}/docs/patches/self_forcing_kv_quant_active_prefix.patch"
 
 if [[ ! -d "${SF_DIR}/.git" ]]; then
   echo "Self-Forcing repo not found at ${SF_DIR}. Run scripts/10_clone_deps.sh first."
@@ -22,6 +23,9 @@ if git apply --check "${PATCH_FILE}" >/dev/null 2>&1; then
 else
   if git apply --reverse --check "${PATCH_FILE}" >/dev/null 2>&1; then
     echo "Patch already applied in Self-Forcing causal_model.py"
+  elif git apply --check "${UPGRADE_PATCH_FILE}" >/dev/null 2>&1; then
+    git apply "${UPGRADE_PATCH_FILE}"
+    echo "Upgraded existing KV quantization hook to active-prefix KIVI storage"
   else
     echo "Patch cannot be applied cleanly; please verify third_party/Self-Forcing state."
     exit 1
