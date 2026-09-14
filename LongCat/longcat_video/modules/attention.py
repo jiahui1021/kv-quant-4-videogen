@@ -160,12 +160,12 @@ class Attention(nn.Module):
         with time_logging_decorator("QK Norm", logging_level=3):
             q, k = self.q_norm(q), self.k_norm(k)
 
-            # QuaRot quantizes post-RoPE keys, so its cache is captured after
-            # rope_3d below.  Every other method keeps the pre-RoPE cache that
-            # ``forward_with_kv_cache`` re-ropes on read.
+            # QuaRot and KIVI quantize post-RoPE keys, so their cache is
+            # captured after rope_3d below.  Every other method keeps the
+            # pre-RoPE cache that ``forward_with_kv_cache`` re-ropes on read.
             cache_post_rope = bool(
                 getattr(self.kv_quantizer, "requires_special_attention_backend", False)
-            )
+            ) or getattr(self.kv_quantizer, "cache_space", None) == "post_rope"
             if return_kv and not cache_post_rope:
                 k_cache, v_cache = k.clone(), v.clone()
 
@@ -297,6 +297,7 @@ class Attention(nn.Module):
                 v_cache = v_cache.repeat(B, 1, 1, 1)
 
             attention_space = bool(kv_cache.get("attention_space")) if is_shared_quant_cache(kv_cache) else False
+            post_rope_cache = is_shared_quant_cache(kv_cache) and kv_cache.get("cache_space") == "post_rope"
 
             if num_cond_latents is not None and num_cond_latents > 0:
                 k_full = torch.cat([k_cache, k], dim=2).contiguous()
@@ -320,6 +321,13 @@ class Attention(nn.Module):
                     k_full = torch.cat([k_cache, new_k], dim=2).contiguous()
                     v_full = torch.cat(
                         [v_cache, self.kv_quantizer.prepare_value(v)], dim=2
+                    ).contiguous()
+                elif post_rope_cache:
+                    # ``k_cache`` was captured after rope_3d at the condition
+                    # frames, so only the new keys are taken from ``k_roped``.
+                    cached_len = k_cache.shape[2]
+                    k_full = torch.cat(
+                        [k_cache, k_roped[:, :, cached_len:]], dim=2
                     ).contiguous()
                 else:
                     k_full = k_roped

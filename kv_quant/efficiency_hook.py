@@ -73,11 +73,21 @@ class SamplingQuantizer(KVQuantizer):
         if self._layer_cursor == 0:
             self._sample()
         result = self._inner.quantize_kv(k, v, meta=meta)
+        self._advance_layer_cursor()
+        return result
+
+    def append_kv(self, state, new_k, new_v, meta=None):
+        if self._layer_cursor == 0:
+            self._sample()
+        result = self._inner.append_kv(state, new_k, new_v, meta=meta)
+        self._advance_layer_cursor()
+        return result
+
+    def _advance_layer_cursor(self) -> None:
         self._layer_cursor += 1
         if self._layer_cursor >= self._num_layers:
             self._layer_cursor = 0
             self._sample()
-        return result
 
     def _sample(self) -> None:
         resident, equivalent = self.resident_kv_bytes()

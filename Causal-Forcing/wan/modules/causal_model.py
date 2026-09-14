@@ -155,21 +155,26 @@ class CausalWanSelfAttention(nn.Module):
     ):
         """Run attention against an append-only quantized KV cache.
 
-        Keys are always cached before RoPE. ``write_k/write_v`` inside the
-        quantizer state represents the current diffusion block, so repeated
-        denoising steps can replace it while older packed segments remain
-        immutable. RoPE is applied only after materializing the attention
-        window, using its absolute frame position.
+        Keys are cached before RoPE unless the quantizer declares
+        ``cache_space = "post_rope"`` (KIVI, matching the official code, which
+        quantizes keys after ``apply_rotary_pos_emb``).  ``write_k/write_v``
+        inside the quantizer state represents the current diffusion block, so
+        repeated denoising steps can replace it while older packed segments
+        remain immutable.  Pre-RoPE keys get RoPE only after materializing the
+        attention window; post-RoPE keys get it at their absolute frame
+        position before they are cached.
         """
         if getattr(quantizer, "requires_special_attention_backend", False):
             raise ValueError(
                 f"{type(quantizer).__name__} rotates Q/K after RoPE and cannot use "
-                "the shared pre-RoPE cache path; route it to "
+                "the shared cache path; route it to "
                 "_attention_with_quarot_cache instead"
             )
+        cache_space = getattr(quantizer, "cache_space", "pre_rope")
+        post_rope = cache_space == "post_rope"
         if self.sink_size and self.local_attn_size != -1:
             raise NotImplementedError(
-                "Shared pre-RoPE RTN/KIVI caches do not support sink retention; "
+                "Shared RTN/KIVI caches do not support sink retention; "
                 "use sink_size=0 until multi-span RoPE is implemented"
             )
 
@@ -180,7 +185,7 @@ class CausalWanSelfAttention(nn.Module):
                     "shape": (int(raw_key.shape[0]), 0, int(raw_key.shape[2]), int(raw_key.shape[3])),
                     "tensor_dtype": value.dtype,
                     "device": value.device,
-                    "cache_space": "pre_rope",
+                    "cache_space": cache_space,
                 }
             )
 
@@ -205,38 +210,55 @@ class CausalWanSelfAttention(nn.Module):
                 else:
                     kv_cache.pop("eviction_slack_tokens", None)
 
+        if post_rope:
+            if current_start % frame_seqlen:
+                raise ValueError("Post-RoPE cache writes must start on a frame boundary")
+            # Positions are absolute, so a key keeps the RoPE phase it was
+            # written with even after the prefix in front of it is evicted.
+            cache_key = causal_rope_apply(
+                raw_key,
+                grid_sizes,
+                freqs,
+                start_frame=current_start // frame_seqlen,
+            ).type_as(value)
+        else:
+            cache_key = raw_key
+
         quantizer.append_kv(
             state,
-            raw_key,
+            cache_key,
             value,
             meta={
                 "tensor_dtype": value.dtype,
                 "absolute_start": int(current_start),
                 "absolute_end": int(current_end),
-                "cache_space": "pre_rope",
+                "cache_space": cache_space,
             },
         )
-        cache_raw_k, cache_v = quantizer.materialize_kv(
+        cache_k, cache_v = quantizer.materialize_kv(
             state,
             meta={
                 "tensor_dtype": value.dtype,
                 "shape": (int(raw_key.shape[0]), 0, int(raw_key.shape[2]), int(raw_key.shape[3])),
                 "device": value.device,
-                "cache_space": "pre_rope",
+                "cache_space": cache_space,
             },
         )
-        local_end_index = int(state.get("num_tokens", cache_raw_k.shape[1]))
+        local_end_index = int(state.get("num_tokens", cache_k.shape[1]))
         attention_start = max(0, local_end_index - int(self.max_attention_size))
-        cache_absolute_start = int(current_end) - int(cache_raw_k.shape[1])
-        absolute_attention_start = cache_absolute_start + attention_start
-        if absolute_attention_start % frame_seqlen:
-            raise ValueError("Shared pre-RoPE cache attention must start on a frame boundary")
-        cache_roped_k = causal_rope_apply_long_input(
-            cache_raw_k[:, attention_start:local_end_index],
-            grid_sizes,
-            freqs,
-            start_frame=absolute_attention_start // frame_seqlen,
-        ).type_as(value)
+        if post_rope:
+            cache_roped_k = cache_k[:, attention_start:local_end_index]
+        else:
+            cache_absolute_start = int(current_end) - int(cache_k.shape[1])
+            absolute_attention_start = cache_absolute_start + attention_start
+            if absolute_attention_start % frame_seqlen:
+                raise ValueError("Shared pre-RoPE cache attention must start on a frame boundary")
+            cache_roped_k = causal_rope_apply_long_input(
+                cache_k[:, attention_start:local_end_index],
+                grid_sizes,
+                freqs,
+                start_frame=absolute_attention_start // frame_seqlen,
+            ).type_as(value)
         x = attention(
             roped_query,
             cache_roped_k,
@@ -303,8 +325,12 @@ class CausalWanSelfAttention(nn.Module):
                 removed = quantizer.evict_prefix(state, requested_eviction)
                 # A partial packed block is intentionally retained.  The
                 # attention slice below still enforces the requested window.
-                if removed == 0:
-                    kv_cache["eviction_slack_tokens"] = int(requested_eviction)
+                if removed < requested_eviction:
+                    kv_cache["eviction_slack_tokens"] = int(
+                        requested_eviction - removed
+                    )
+                else:
+                    kv_cache.pop("eviction_slack_tokens", None)
 
         # Positions are absolute, so a key keeps the RoPE phase it was written
         # with even after the prefix in front of it has been evicted.

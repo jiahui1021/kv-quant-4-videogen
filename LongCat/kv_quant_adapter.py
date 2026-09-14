@@ -43,6 +43,13 @@ def encode_longcat_kv(k: torch.Tensor, v: torch.Tensor, quantizer) -> dict[str, 
     attention_space = bool(
         getattr(quantizer, "requires_special_attention_backend", False)
     )
+    # The caller captures K after RoPE for QuaRot and for methods that declare
+    # ``cache_space = "post_rope"`` (KIVI); the payload records which it is.
+    cache_space = (
+        "post_rope"
+        if attention_space
+        else getattr(quantizer, "cache_space", "pre_rope")
+    )
     state = quantizer.quantize_kv(
         longcat_to_shared(k),
         longcat_to_shared(v),
@@ -58,6 +65,7 @@ def encode_longcat_kv(k: torch.Tensor, v: torch.Tensor, quantizer) -> dict[str, 
         "dtype": dtype,
         "shape": tuple(k.shape),
         "attention_space": attention_space,
+        "cache_space": cache_space,
     }
 
 

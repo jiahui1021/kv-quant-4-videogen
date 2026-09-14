@@ -213,20 +213,26 @@ def _self_forcing_patch_regression() -> dict:
     )
     text = patch_path.read_text(encoding="utf-8")
     required = (
+        # Methods without an incremental cache: active-prefix requantization.
         'cache_k[:, :local_end_index]',
         'cache_v[:, :local_end_index]',
         'active_k, active_v = quantizer.dequantize_kv',
         'cache_k = torch.zeros(',
+        # KIVI: official append-only cache of post-RoPE keys, never requantized.
+        'getattr(quantizer, "cache_space", None) == "post_rope"',
+        'quantizer.append_kv(',
+        'quantizer.materialize_kv(',
     )
     missing = [snippet for snippet in required if snippet not in text]
     if missing:
         raise AssertionError(
-            "Self-Forcing patch does not preserve active-prefix KIVI semantics: "
+            "Self-Forcing patch does not preserve the expected cache semantics: "
             + ", ".join(missing)
         )
     return {
         "compresses_active_prefix_only": True,
         "restores_dense_work_capacity": True,
+        "kivi_post_rope_append_only": True,
     }
 
 

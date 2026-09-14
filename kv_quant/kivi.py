@@ -25,7 +25,12 @@ class KIVIQuantizer(KVQuantizer):
     token, per head, and per channel group; heads therefore never share a
     value scale.  The incremental path keeps a configurable recent BF16
     residual and migrates only complete sequence blocks.
+
+    Official KIVI (``models/llama_kivi.py``) quantizes ``key_states`` after
+    ``apply_rotary_pos_emb``, so integrations must cache post-RoPE keys.
     """
+
+    cache_space = "post_rope"
 
     def __init__(
         self,

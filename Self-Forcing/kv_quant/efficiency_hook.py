@@ -6,8 +6,9 @@ on write inside ``CausalWanSelfAttention``.  The pipeline's block loop is in
 unpatched upstream code, so there is no block hook available without extending
 that patch.
 
-The wrapper below reconstructs the boundary instead: ``quantize_kv`` is called
-once per layer per block, so a wrap of the layer counter marks a new block.
+The wrapper below reconstructs the boundary instead: ``quantize_kv`` (or
+``append_kv`` on the incremental KIVI path) is called once per layer per
+block, so a wrap of the layer counter marks a new block.
 The sample is taken before the block's first layer is quantized and again
 after, which is the same dense/packed state the other two repositories sample.
 The equality gate in ``collect_efficiency.py`` -- every method's
@@ -94,11 +95,23 @@ class SamplingQuantizer(KVQuantizer):
         if self._layer_cursor == 0:
             self._sample()
         result = self._inner.quantize_kv(k, v, meta=meta)
+        self._advance_layer_cursor()
+        return result
+
+    def append_kv(self, state, new_k, new_v, meta=None):
+        # The incremental (KIVI) cache path writes through ``append_kv``
+        # instead of ``quantize_kv``, still once per layer per call.
+        if self._layer_cursor == 0:
+            self._sample()
+        result = self._inner.append_kv(state, new_k, new_v, meta=meta)
+        self._advance_layer_cursor()
+        return result
+
+    def _advance_layer_cursor(self) -> None:
         self._layer_cursor += 1
         if self._layer_cursor >= self._num_layers:
             self._layer_cursor = 0
             self._sample()
-        return result
 
     def _sample(self) -> None:
         resident, equivalent = self.resident_kv_bytes()
