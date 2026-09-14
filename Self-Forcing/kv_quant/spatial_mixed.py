@@ -6,7 +6,7 @@ import torch
 
 from .base import KVQuantizer
 from .kivi import KIVIQuantizer
-from .quarot_kv import QuaRotKVQuantizer
+from .quarot_kv import CompositeQuaRotKVQuantizer
 from .rtn import RTNQuantizer
 from .utils import timed
 
@@ -21,7 +21,7 @@ class SpatialMixedQuantizer(KVQuantizer):
     _METHOD_TO_CLASS = {
         "RTN": RTNQuantizer,
         "KIVI": KIVIQuantizer,
-        "QUAROT_KV": QuaRotKVQuantizer,
+        "QUAROT_KV": CompositeQuaRotKVQuantizer,
     }
 
     def __init__(
