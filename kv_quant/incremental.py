@@ -263,26 +263,34 @@ def materialize(
     decode_segment: Callable[[Dict[str, Any]], torch.Tensor],
     meta: Dict[str, Any] | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    k_parts = list(iter_tensor_parts(state, "k"))
-    v_parts = list(iter_tensor_parts(state, "v"))
-    if not k_parts:
-        empty = _empty_from_state(state, meta, None, None)
-        return empty, empty.clone()
+    # ``meta["start_token"]`` limits decoding to the attention window: parts
+    # entirely before it are neither unpacked nor dequantized.
+    start = max(int((meta or {}).get("start_token", 0)), 0)
     decoded_k = []
     decoded_v = []
+    cursor = 0
     for segment in state["segments"]:
-        decoded_k.append(decode_segment(segment["k"]))
-        decoded_v.append(decode_segment(segment["v"]))
-    residual_k = state.get("residual_k")
-    residual_v = state.get("residual_v")
-    if isinstance(residual_k, torch.Tensor) and residual_k.shape[1] > 0:
-        decoded_k.append(residual_k)
-        decoded_v.append(residual_v)
-    write_k = state.get("write_k")
-    write_v = state.get("write_v")
-    if isinstance(write_k, torch.Tensor) and write_k.shape[1] > 0:
-        decoded_k.append(write_k)
-        decoded_v.append(write_v)
+        length = int(segment["length"])
+        if cursor + length > start:
+            skip = max(start - cursor, 0)
+            decoded_k.append(decode_segment(segment["k"])[:, skip:])
+            decoded_v.append(decode_segment(segment["v"])[:, skip:])
+        cursor += length
+    for name in ("residual", "write"):
+        buffered_k = state.get(f"{name}_k")
+        buffered_v = state.get(f"{name}_v")
+        if isinstance(buffered_k, torch.Tensor) and buffered_k.shape[1] > 0:
+            length = int(buffered_k.shape[1])
+            if cursor + length > start:
+                skip = max(start - cursor, 0)
+                decoded_k.append(buffered_k[:, skip:])
+                decoded_v.append(buffered_v[:, skip:])
+            cursor += length
+    if not decoded_k:
+        empty = _empty_from_state(state, meta, None, None)
+        return empty, empty.clone()
+    if len(decoded_k) == 1:
+        return decoded_k[0], decoded_v[0]
     return torch.cat(decoded_k, dim=1), torch.cat(decoded_v, dim=1)
 
 

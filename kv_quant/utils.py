@@ -20,7 +20,8 @@ def _reshape_blocks(x: torch.Tensor, block_size: int) -> Tuple[torch.Tensor, int
         pad = torch.zeros((b, pad_len, h, d), device=x.device, dtype=x.dtype)
         x = torch.cat([x, pad], dim=1)
     nb = x.shape[1] // block_size
-    return x.view(b, nb, block_size, h, d), pad_len
+    # ``reshape``: callers may pass a permuted view (LongCat's cache layout).
+    return x.reshape(b, nb, block_size, h, d), pad_len
 
 
 def _unshape_blocks(xb: torch.Tensor, pad_len: int, orig_len: int) -> torch.Tensor:
@@ -66,7 +67,11 @@ def dequantize_asym(
     zero: torch.Tensor,
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    return q.to(dtype) * scale.to(dtype) + zero.to(dtype)
+    # In place on one fresh copy: same arithmetic order, one full-size buffer.
+    out = q.to(dtype, copy=True)
+    out.mul_(scale.to(dtype))
+    out.add_(zero.to(dtype))
+    return out
 
 
 def quantize_sym(x: torch.Tensor, bits: int, reduce_dims: Tuple[int, ...]):
@@ -82,7 +87,9 @@ def dequantize_sym(
     scale: torch.Tensor,
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    return q.to(dtype) * scale.to(dtype)
+    out = q.to(dtype, copy=True)
+    out.mul_(scale.to(dtype))
+    return out
 
 
 def fwht_last_dim(x: torch.Tensor) -> torch.Tensor:
@@ -208,10 +215,11 @@ def quarot_dequantize(
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     """QuaRot ``sym_dequant``/``asym_dequant``."""
-    values = q.to(torch.float32)
+    values = q.to(torch.float32, copy=True)
     if not sym:
-        values = values - zero.to(torch.float32)
-    return (values * scale.to(torch.float32)).to(dtype)
+        values.sub_(zero.to(torch.float32))
+    values.mul_(scale.to(torch.float32))
+    return values.to(dtype)
 
 
 class TimingResult:

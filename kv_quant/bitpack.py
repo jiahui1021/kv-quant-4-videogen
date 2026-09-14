@@ -1,4 +1,11 @@
-"""Physical bit packing for the integer KV-cache payloads."""
+"""Physical bit packing for the integer KV-cache payloads.
+
+Packing and unpacking run on ``uint8``/``int8`` in bounded chunks.  Widening
+to ``int32`` over the whole cache made the transient several times the size
+of the BF16 cache it replaced, which is what ran long generations out of
+memory.  The byte layout is unchanged: value ``j`` of a byte sits at bit
+``j * bits``.
+"""
 
 from __future__ import annotations
 
@@ -6,10 +13,38 @@ from typing import Sequence
 
 import torch
 
+# Values processed per chunk; bounds the transient independently of cache size.
+_CHUNK_VALUES = 1 << 24
+
 
 def _validate_bits(bits: int) -> None:
     if bits not in (2, 4):
         raise ValueError(f"Only INT2 and INT4 packing is supported, got bits={bits}.")
+
+
+def _codes(q: torch.Tensor, bits: int, signed: bool) -> torch.Tensor:
+    """Map int8 quantization values to unsigned ``bits``-wide codes."""
+    offset = (1 << (bits - 1)) if signed else 0
+    mask = (1 << bits) - 1
+    return (q.to(torch.int16) + offset).clamp_(0, mask).to(torch.uint8)
+
+
+def _pack_codes_into(out: torch.Tensor, codes: torch.Tensor, bits: int) -> None:
+    """OR ``codes[..., j]`` into ``out`` at bit ``j * bits``."""
+    for j in range(codes.shape[-1]):
+        out |= codes[..., j] << (j * bits)
+
+
+def _unpack_codes(packed: torch.Tensor, bits: int) -> torch.Tensor:
+    """``[..., bytes]`` uint8 -> ``[..., bytes * values_per_byte]`` uint8 codes."""
+    values_per_byte = 8 // bits
+    mask = (1 << bits) - 1
+    codes = torch.empty(
+        (*packed.shape, values_per_byte), dtype=torch.uint8, device=packed.device
+    )
+    for j in range(values_per_byte):
+        torch.bitwise_and(packed >> (j * bits), mask, out=codes[..., j])
+    return codes.reshape(*packed.shape[:-1], -1)
 
 
 def pack_bits(q: torch.Tensor, bits: int, *, signed: bool) -> torch.Tensor:
@@ -25,22 +60,23 @@ def pack_bits(q: torch.Tensor, bits: int, *, signed: bool) -> torch.Tensor:
         raise TypeError(f"Expected an int8 quantization tensor, got dtype={q.dtype}.")
 
     values_per_byte = 8 // bits
-    value_mask = (1 << bits) - 1
-    offset = (1 << (bits - 1)) if signed else 0
-    values = q.reshape(-1).to(torch.int32) + offset
-    values = values.clamp(0, value_mask)
-
-    pad = (-values.numel()) % values_per_byte
-    if pad:
-        values = torch.cat(
-            [values, torch.zeros(pad, dtype=values.dtype, device=values.device)]
-        )
-
-    shifts = torch.arange(
-        values_per_byte, dtype=torch.int32, device=values.device
-    ) * bits
-    packed = (values.reshape(-1, values_per_byte) << shifts).sum(dim=1)
-    return packed.to(torch.uint8)
+    flat = q.reshape(-1)
+    numel = flat.numel()
+    packed = torch.zeros(
+        (numel + values_per_byte - 1) // values_per_byte,
+        dtype=torch.uint8,
+        device=q.device,
+    )
+    chunk = (_CHUNK_VALUES // values_per_byte) * values_per_byte
+    for start in range(0, numel, chunk):
+        end = min(start + chunk, numel)
+        codes = _codes(flat[start:end], bits, signed)
+        pad = (-codes.numel()) % values_per_byte
+        if pad:
+            codes = torch.cat([codes, codes.new_zeros(pad)])
+        out = packed[start // values_per_byte:(end + values_per_byte - 1) // values_per_byte]
+        _pack_codes_into(out, codes.view(-1, values_per_byte), bits)
+    return packed
 
 
 def pack_bits_rows(
@@ -73,34 +109,23 @@ def pack_bits_rows(
     rows = q.reshape(-1, values_per_row)
 
     values_per_byte = 8 // bits
-    value_mask = (1 << bits) - 1
-    offset = (1 << (bits - 1)) if signed else 0
-    values = rows.to(torch.int32) + offset
-    values = values.clamp(0, value_mask)
-
     row_pad = (-values_per_row) % values_per_byte
-    if row_pad:
-        values = torch.cat(
-            [
-                values,
-                torch.zeros(
-                    values.shape[0],
-                    row_pad,
-                    dtype=values.dtype,
-                    device=values.device,
-                ),
-            ],
-            dim=1,
-        )
-
-    shifts = (
-        torch.arange(values_per_byte, dtype=torch.int32, device=values.device)
-        * bits
+    bytes_per_row = (values_per_row + row_pad) // values_per_byte
+    packed = torch.zeros(
+        (rows.shape[0], bytes_per_row), dtype=torch.uint8, device=q.device
     )
-    packed = (
-        values.reshape(values.shape[0], -1, values_per_byte) << shifts
-    ).sum(dim=-1)
-    return packed.to(torch.uint8).reshape(*leading_shape, packed.shape[-1])
+    chunk_rows = max(_CHUNK_VALUES // max(values_per_row, 1), 1)
+    for start in range(0, rows.shape[0], chunk_rows):
+        end = min(start + chunk_rows, rows.shape[0])
+        codes = _codes(rows[start:end], bits, signed)
+        if row_pad:
+            codes = torch.cat([codes, codes.new_zeros(end - start, row_pad)], dim=1)
+        _pack_codes_into(
+            packed[start:end],
+            codes.view(end - start, bytes_per_row, values_per_byte),
+            bits,
+        )
+    return packed.reshape(*leading_shape, bytes_per_row)
 
 
 def unpack_bits(
@@ -136,14 +161,20 @@ def unpack_bits(
             f"but {required_bytes} are required for {numel} values."
         )
 
-    value_mask = (1 << bits) - 1
     offset = (1 << (bits - 1)) if signed else 0
-    shifts = torch.arange(
-        values_per_byte, dtype=torch.int32, device=packed.device
-    ) * bits
-    values = (packed.reshape(-1).to(torch.int32)[:, None] >> shifts) & value_mask
-    values = values.reshape(-1)[:numel] - offset
-    return values.to(torch.int8).reshape(shape)
+    flat = packed.reshape(-1)
+    out = torch.empty(numel, dtype=torch.int8, device=packed.device)
+    chunk_bytes = max(_CHUNK_VALUES // values_per_byte, 1)
+    for byte_start in range(0, required_bytes, chunk_bytes):
+        byte_end = min(byte_start + chunk_bytes, required_bytes)
+        start = byte_start * values_per_byte
+        end = min(byte_end * values_per_byte, numel)
+        codes = _unpack_codes(flat[byte_start:byte_end], bits)[: end - start]
+        target = out[start:end]
+        target.copy_(codes)
+        if offset:
+            target.sub_(offset)
+    return out.reshape(shape)
 
 
 def unpack_bits_rows(
@@ -179,13 +210,15 @@ def unpack_bits_rows(
             f"{rows * required_row_bytes} are required for shape={shape}."
         )
 
-    value_mask = (1 << bits) - 1
     offset = (1 << (bits - 1)) if signed else 0
-    shifts = (
-        torch.arange(values_per_byte, dtype=torch.int32, device=packed.device)
-        * bits
-    )
-    packed_rows = packed.reshape(rows, required_row_bytes).to(torch.int32)
-    values = (packed_rows[:, :, None] >> shifts) & value_mask
-    values = values.reshape(rows, -1)[:, :values_per_row] - offset
-    return values.to(torch.int8).reshape(shape)
+    packed_rows = packed.reshape(rows, required_row_bytes)
+    out = torch.empty((rows, values_per_row), dtype=torch.int8, device=packed.device)
+    chunk_rows = max(_CHUNK_VALUES // max(values_per_row, 1), 1)
+    for start in range(0, rows, chunk_rows):
+        end = min(start + chunk_rows, rows)
+        codes = _unpack_codes(packed_rows[start:end], bits)[:, :values_per_row]
+        target = out[start:end]
+        target.copy_(codes)
+        if offset:
+            target.sub_(offset)
+    return out.reshape(shape)

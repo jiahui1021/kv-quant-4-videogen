@@ -17,21 +17,30 @@ FORMAT_NAME = "shared_kv_quant_v1"
 
 
 def longcat_to_shared(x: torch.Tensor) -> torch.Tensor:
-    """Convert LongCat ``[B, H, S, D]`` to shared ``[B, S, H, D]``."""
+    """Convert LongCat ``[B, H, S, D]`` to shared ``[B, S, H, D]``.
+
+    Returns a permuted view.  A contiguous copy of the whole condition cache
+    would be held for the full quantization call; the quantizers copy only
+    what they reshape.
+    """
     if x.ndim != 4:
         raise ValueError(
             f"Expected LongCat KV with shape [B, H, S, D], got {tuple(x.shape)}"
         )
-    return x.permute(0, 2, 1, 3).contiguous()
+    return x.permute(0, 2, 1, 3)
 
 
 def shared_to_longcat(x: torch.Tensor) -> torch.Tensor:
-    """Convert shared ``[B, S, H, D]`` to LongCat ``[B, H, S, D]``."""
+    """Convert shared ``[B, S, H, D]`` to LongCat ``[B, H, S, D]``.
+
+    Returns a permuted view; the attention concatenates it with the new
+    tokens anyway, so a contiguous copy would only add a transient.
+    """
     if x.ndim != 4:
         raise ValueError(
             f"Expected shared KV with shape [B, S, H, D], got {tuple(x.shape)}"
         )
-    return x.permute(0, 2, 1, 3).contiguous()
+    return x.permute(0, 2, 1, 3)
 
 
 def encode_longcat_kv(k: torch.Tensor, v: torch.Tensor, quantizer) -> dict[str, Any]:

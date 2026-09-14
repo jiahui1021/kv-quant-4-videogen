@@ -1,17 +1,17 @@
 diff --git a/wan/modules/causal_model.py b/wan/modules/causal_model.py
-index 98e398a..7c45a24 100644
+index 98e398a..48145bb 100644
 --- a/wan/modules/causal_model.py
 +++ b/wan/modules/causal_model.py
-@@ -83,6 +83,99 @@ class CausalWanSelfAttention(nn.Module):
+@@ -83,6 +83,97 @@ class CausalWanSelfAttention(nn.Module):
          self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
          self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
  
 +    def _attention_with_incremental_cache(
 +        self, roped_query, roped_key, value, kv_cache, quantizer, current_start
 +    ):
-+        """Append-only quantized cache for methods that quantize post-RoPE keys.
++        """Append-only quantized cache of post-RoPE keys (RTN, KIVI, QuaRot).
 +
-+        Neither KIVI nor QuaRot re-quantizes history.  The current block stays
++        History is never re-quantized, and only the attention window is decoded.  The current block stays
 +        in the quantizer's mutable write buffer, so repeated denoising steps
 +        replace it, and a block is packed only once the next block arrives.
 +        QuaRot additionally rotates Q/K by the same Hadamard and caches V in
@@ -70,21 +70,19 @@ index 98e398a..7c45a24 100644
 +                "attention_space": rotated,
 +            },
 +        )
++        local_end_index = int(state["num_tokens"])
++        attention_start = max(0, local_end_index - int(self.max_attention_size))
++        # Only the attention window is decoded; older history stays packed.
 +        cache_k, cache_v = quantizer.materialize_kv(
 +            state,
 +            meta={
 +                "tensor_dtype": value.dtype,
 +                "shape": (int(b), 0, int(n), int(d)),
 +                "device": value.device,
++                "start_token": attention_start,
 +            },
 +        )
-+        local_end_index = int(state["num_tokens"])
-+        attention_start = max(0, local_end_index - int(self.max_attention_size))
-+        x = attention(
-+            roped_query,
-+            cache_k[:, attention_start:local_end_index],
-+            cache_v[:, attention_start:local_end_index],
-+        )
++        x = attention(roped_query, cache_k, cache_v)
 +        if rotated:
 +            x = quantizer.restore_attention_output(x).type_as(value)
 +        kv_cache["global_end_index"].fill_(current_end)
@@ -102,15 +100,15 @@ index 98e398a..7c45a24 100644
      def forward(
          self,
          x,
-@@ -197,11 +290,58 @@ class CausalWanSelfAttention(nn.Module):
+@@ -197,11 +288,58 @@ class CausalWanSelfAttention(nn.Module):
                  q, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
              roped_key = causal_rope_apply(
                  k, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
 +            quantizer = kv_cache.get("quantizer", None)
-+            if quantizer is not None and (
-+                getattr(quantizer, "cache_space", None) == "post_rope"
-+                or getattr(quantizer, "requires_special_attention_backend", False)
-+            ):
++            # RTN/KIVI/QuaRot keep an append-only cache and decode only the
++            # attention window.  Composite methods without that API keep the
++            # per-call requantization below, whose cost grows with history.
++            if quantizer is not None and getattr(quantizer, "supports_incremental_cache", False):
 +                x = self._attention_with_incremental_cache(
 +                    roped_query, roped_key, v, kv_cache, quantizer, current_start)
 +                x = x.flatten(2)
@@ -162,7 +160,7 @@ index 98e398a..7c45a24 100644
              num_new_tokens = roped_query.shape[1]
              if self.local_attn_size != -1 and (current_end > kv_cache["global_end_index"].item()) and (
                      num_new_tokens + kv_cache["local_end_index"].item() > kv_cache_size):
-@@ -210,29 +350,42 @@ class CausalWanSelfAttention(nn.Module):
+@@ -210,29 +348,42 @@ class CausalWanSelfAttention(nn.Module):
                  # Clone the source slice to avoid overlapping memory error
                  num_evicted_tokens = num_new_tokens + kv_cache["local_end_index"].item() - kv_cache_size
                  num_rolled_tokens = kv_cache["local_end_index"].item() - num_evicted_tokens - sink_tokens

@@ -31,6 +31,8 @@ class KIVIQuantizer(KVQuantizer):
     """
 
     cache_space = "post_rope"
+    #: Implements init_state/append_kv/materialize_kv for an append-only cache.
+    supports_incremental_cache = True
 
     def __init__(
         self,
@@ -476,35 +478,54 @@ class KIVIQuantizer(KVQuantizer):
         self.stats.compressed_kv_bytes = self.memory_bytes(state)
         return state
 
+    @staticmethod
+    def _window_parts(segments, buffers, decode, start: int) -> list:
+        """Decode only the parts of one stream at or after token ``start``.
+
+        Attention reads a bounded window, so history before it is neither
+        unpacked nor dequantized; a long generation otherwise decodes its
+        entire (never-attended) prefix on every call.
+        """
+        parts = []
+        cursor = 0
+        for segment in segments:
+            length = int(segment["length"])
+            if cursor + length > start:
+                part = decode(segment["state"])
+                parts.append(part[:, start - cursor:] if cursor < start else part)
+            cursor += length
+        for buffered in buffers:
+            if isinstance(buffered, torch.Tensor) and buffered.shape[1] > 0:
+                length = int(buffered.shape[1])
+                if cursor + length > start:
+                    parts.append(buffered[:, max(start - cursor, 0):])
+                cursor += length
+        return parts
+
     def _materialize_incremental(
         self,
         state: Dict[str, Any],
         meta: Dict[str, Any] | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        start = max(int((meta or {}).get("start_token", 0)), 0)
         with timed(state_device(state), enabled=self.stats.timing_enabled) as timer:
-            k_parts = []
-            v_parts = []
-            for segment in state["k_segments"]:
-                k_parts.append(self._dequantize_keys(segment["state"]))
-            for segment in state["v_segments"]:
-                v_parts.append(self._dequantize_values(segment["state"]))
-            residual_k = state.get("residual_k")
-            residual_v = state.get("residual_v")
-            write_k = state.get("write_k")
-            write_v = state.get("write_v")
-            if isinstance(residual_k, torch.Tensor) and residual_k.shape[1] > 0:
-                k_parts.append(residual_k)
-            if isinstance(residual_v, torch.Tensor) and residual_v.shape[1] > 0:
-                v_parts.append(residual_v)
-            if isinstance(write_k, torch.Tensor) and write_k.shape[1] > 0:
-                k_parts.append(write_k)
-            if isinstance(write_v, torch.Tensor) and write_v.shape[1] > 0:
-                v_parts.append(write_v)
+            k_parts = self._window_parts(
+                state["k_segments"],
+                (state.get("residual_k"), state.get("write_k")),
+                self._dequantize_keys,
+                start,
+            )
+            v_parts = self._window_parts(
+                state["v_segments"],
+                (state.get("residual_v"), state.get("write_v")),
+                self._dequantize_values,
+                start,
+            )
             if k_parts or v_parts:
                 if not k_parts or not v_parts:
                     raise ValueError("KIVI K/V materialization streams are incomplete")
-                k = torch.cat(k_parts, dim=1)
-                v = torch.cat(v_parts, dim=1)
+                k = k_parts[0] if len(k_parts) == 1 else torch.cat(k_parts, dim=1)
+                v = v_parts[0] if len(v_parts) == 1 else torch.cat(v_parts, dim=1)
                 if k.shape[1] != v.shape[1]:
                     raise ValueError(
                         f"KIVI K/V materialized lengths differ: {k.shape[1]} != {v.shape[1]}"

@@ -218,10 +218,12 @@ def _self_forcing_patch_regression() -> dict:
         'cache_v[:, :local_end_index]',
         'active_k, active_v = quantizer.dequantize_kv',
         'cache_k = torch.zeros(',
-        # KIVI: official append-only cache of post-RoPE keys, never requantized.
-        'getattr(quantizer, "cache_space", None) == "post_rope"',
+        # RTN/KIVI/QuaRot: append-only cache of post-RoPE keys, never
+        # requantized, decoded only over the attention window.
+        'getattr(quantizer, "supports_incremental_cache", False)',
         'quantizer.append_kv(',
         'quantizer.materialize_kv(',
+        '"start_token": attention_start',
     )
     missing = [snippet for snippet in required if snippet not in text]
     if missing:

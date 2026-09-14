@@ -66,6 +66,8 @@ class QuaRotKVQuantizer(KVQuantizer):
 
     #: QuaRot asserts ``k_groupsize in [-1, head_dim]``.
     TOKEN_WISE_GROUP = -1
+    #: Implements init_state/append_kv/materialize_kv for an append-only cache.
+    supports_incremental_cache = True
 
     def __init__(
         self,
@@ -153,33 +155,65 @@ class QuaRotKVQuantizer(KVQuantizer):
         group = self._resolve_group(d, h)
         return x.reshape(b, l, (h * d) // group, group)
 
+    #: Values rotated and quantized per chunk.  The FWHT works in float32 and
+    #: allocates per level, so a whole long cache at once is ~10x its size.
+    _CHUNK_VALUES = 1 << 24
+
     def _quantize_rotated(
-        self, x: torch.Tensor, bits: int, *, is_value: bool = False
+        self,
+        x: torch.Tensor,
+        bits: int,
+        *,
+        is_value: bool = False,
+        rotate=None,
     ) -> Dict[str, Any]:
-        xg = self._grouped(x)
+        """Quantize ``x`` per token, applying ``rotate`` chunk by chunk first.
+
+        Every step is per token (the Hadamard acts on the last dimension and
+        the ranges are per token group), so chunking along the sequence gives
+        the same codes and scales as one full-size pass.
+        """
         if is_value and self.channel_group_size != self.TOKEN_WISE_GROUP:
             find_params = quarot_find_params_groupwise
         else:
             find_params = quarot_find_params
-        scale, zero = find_params(xg, bits, self.sym, self.clip_ratio)
-        q = quarot_quantize(xg, scale, zero, bits, self.sym)
+        b, l, h, d = x.shape
+        group = self._resolve_group(d, h)
+        groups = (h * d) // group
+        q = torch.empty((b, l, groups, group), dtype=torch.int8, device=x.device)
+        scales, zeros = [], []
+        tensor_dtype = x.dtype
+        chunk = max(self._CHUNK_VALUES // max(b * h * d, 1), 1)
+        for start in range(0, l, chunk):
+            xc = x[:, start:start + chunk]
+            if rotate is not None:
+                xc = rotate(xc)
+                tensor_dtype = xc.dtype
+            xg = self._grouped(xc)
+            scale, zero = find_params(xg, bits, self.sym, self.clip_ratio)
+            q[:, start:start + chunk] = quarot_quantize(xg, scale, zero, bits, self.sym)
+            scales.append(scale.to(torch.float16))
+            if not self.sym:
+                zeros.append(zero.to(torch.float16))
+            del xc, xg, scale, zero
+        empty_params = torch.empty((b, 0, groups, 1), dtype=torch.float16, device=x.device)
         state = {
             "q": pack_bits(q, bits, signed=self.sym),
             "q_shape": tuple(q.shape),
             "q_numel": int(q.numel()),
             "packed": True,
             "signed": self.sym,
-            "scale": scale.to(torch.float16),
+            "scale": torch.cat(scales, dim=1) if scales else empty_params,
             "orig_shape": tuple(x.shape),
             "bits": bits,
             "sym": self.sym,
-            "channel_group_size": int(xg.shape[-1]),
+            "channel_group_size": int(group),
             "axis": "post_rope_token_group",
             "rotated": True,
-            "tensor_dtype": x.dtype,
+            "tensor_dtype": tensor_dtype,
         }
         if not self.sym:
-            state["zero"] = zero.to(torch.float16)
+            state["zero"] = torch.cat(zeros, dim=1) if zeros else empty_params.clone()
         return state
 
     def _dequantize_rotated(self, state: Dict[str, Any]) -> torch.Tensor:
@@ -313,19 +347,32 @@ class QuaRotKVQuantizer(KVQuantizer):
         state: Dict[str, Any],
         meta: Dict[str, Any] | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # ``meta["start_token"]`` limits decoding to the attention window.
+        start = max(int((meta or {}).get("start_token", 0)), 0)
         with timed(state_device(state), enabled=self.stats.timing_enabled) as timer:
             k_parts = []
             v_parts = []
+            cursor = 0
             for segment in state["segments"]:
-                k_parts.append(self._dequantize_rotated(segment["k"]))
-                v_parts.append(self._dequantize_rotated(segment["v"]))
+                length = int(segment["length"])
+                if cursor + length > start:
+                    skip = max(start - cursor, 0)
+                    k_parts.append(self._dequantize_rotated(segment["k"])[:, skip:])
+                    v_parts.append(self._dequantize_rotated(segment["v"])[:, skip:])
+                cursor += length
             for name in ("residual", "write"):
                 buffered_k = state.get(f"{name}_k")
                 buffered_v = state.get(f"{name}_v")
                 if isinstance(buffered_k, torch.Tensor) and buffered_k.shape[1] > 0:
-                    k_parts.append(buffered_k)
-                    v_parts.append(buffered_v)
-            if k_parts:
+                    length = int(buffered_k.shape[1])
+                    if cursor + length > start:
+                        skip = max(start - cursor, 0)
+                        k_parts.append(buffered_k[:, skip:])
+                        v_parts.append(buffered_v[:, skip:])
+                    cursor += length
+            if len(k_parts) == 1:
+                k, v = k_parts[0], v_parts[0]
+            elif k_parts:
                 k, v = torch.cat(k_parts, dim=1), torch.cat(v_parts, dim=1)
             else:
                 shape = tuple(int(dim) for dim in (meta or {}).get("shape", state.get("shape", (0, 0, 0, 0))))
@@ -359,10 +406,20 @@ class QuaRotKVQuantizer(KVQuantizer):
         meta = dict(meta or {})
         already_rotated = bool(meta.get("already_rotated", False))
         bf16_bytes = int(k.numel() * k.element_size() + v.numel() * v.element_size())
-        rotated_k, rotated_v = self._rotate_new_kv(k, v, already_rotated)
         with timed(k.device, enabled=self.stats.timing_enabled) as timer:
-            k_state = self._quantize_rotated(rotated_k, self.key_bits)
-            v_state = self._quantize_rotated(rotated_v, self.value_bits, is_value=True)
+            # Rotation runs inside the chunked quantization loop, so the full
+            # rotated float32 cache never exists at once.
+            k_state = self._quantize_rotated(
+                k,
+                self.key_bits,
+                rotate=None if already_rotated else self._rotate,
+            )
+            v_state = self._quantize_rotated(
+                v,
+                self.value_bits,
+                is_value=True,
+                rotate=None if already_rotated else self.prepare_value,
+            )
             tensor_dtype = meta.get("tensor_dtype", k.dtype)
             k_state["tensor_dtype"] = tensor_dtype
             v_state["tensor_dtype"] = tensor_dtype

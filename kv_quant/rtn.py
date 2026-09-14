@@ -26,6 +26,9 @@ from .utils import dequantize_sym, quantize_sym, reshape_channel_groups, timed
 class RTNQuantizer(KVQuantizer):
     """Blockwise symmetric RTN with an append-only cache representation."""
 
+    #: Implements init_state/append_kv/materialize_kv for an append-only cache.
+    supports_incremental_cache = True
+
     def __init__(
         self,
         bits: int = 4,

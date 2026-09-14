@@ -235,6 +235,9 @@ class CausalWanSelfAttention(nn.Module):
                 "cache_space": cache_space,
             },
         )
+        local_end_index = int(state["num_tokens"])
+        attention_start = max(0, local_end_index - int(self.max_attention_size))
+        # Only the attention window is decoded; older history stays packed.
         cache_k, cache_v = quantizer.materialize_kv(
             state,
             meta={
@@ -242,28 +245,22 @@ class CausalWanSelfAttention(nn.Module):
                 "shape": (int(raw_key.shape[0]), 0, int(raw_key.shape[2]), int(raw_key.shape[3])),
                 "device": value.device,
                 "cache_space": cache_space,
+                "start_token": attention_start,
             },
         )
-        local_end_index = int(state.get("num_tokens", cache_k.shape[1]))
-        attention_start = max(0, local_end_index - int(self.max_attention_size))
         if post_rope:
-            cache_roped_k = cache_k[:, attention_start:local_end_index]
+            cache_roped_k = cache_k
         else:
-            cache_absolute_start = int(current_end) - int(cache_k.shape[1])
-            absolute_attention_start = cache_absolute_start + attention_start
+            absolute_attention_start = int(current_end) - int(cache_k.shape[1])
             if absolute_attention_start % frame_seqlen:
                 raise ValueError("Shared pre-RoPE cache attention must start on a frame boundary")
             cache_roped_k = causal_rope_apply_long_input(
-                cache_k[:, attention_start:local_end_index],
+                cache_k,
                 grid_sizes,
                 freqs,
                 start_frame=absolute_attention_start // frame_seqlen,
             ).type_as(value)
-        x = attention(
-            roped_query,
-            cache_roped_k,
-            cache_v[:, attention_start:local_end_index],
-        )
+        x = attention(roped_query, cache_roped_k, cache_v)
 
         kv_cache["quant_state"] = state
         kv_cache["k"] = value.new_empty(0)
@@ -356,6 +353,9 @@ class CausalWanSelfAttention(nn.Module):
                 "attention_space": True,
             },
         )
+        local_end_index = int(state["num_tokens"])
+        attention_start = max(0, local_end_index - int(self.max_attention_size))
+        # Only the attention window is decoded; older history stays packed.
         cache_k, cache_v = quantizer.materialize_kv(
             state,
             meta={
@@ -363,15 +363,10 @@ class CausalWanSelfAttention(nn.Module):
                 "shape": (int(raw_key.shape[0]), 0, int(raw_key.shape[2]), int(raw_key.shape[3])),
                 "device": value.device,
                 "cache_space": "post_rope",
+                "start_token": attention_start,
             },
         )
-        local_end_index = int(state.get("num_tokens", cache_k.shape[1]))
-        attention_start = max(0, local_end_index - int(self.max_attention_size))
-        x = attention(
-            rotated_query,
-            cache_k[:, attention_start:local_end_index],
-            cache_v[:, attention_start:local_end_index],
-        )
+        x = attention(rotated_query, cache_k, cache_v)
         x = quantizer.restore_attention_output(x).type_as(value)
 
         kv_cache["quant_state"] = state
