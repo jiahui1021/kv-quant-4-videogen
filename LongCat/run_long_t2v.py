@@ -254,7 +254,7 @@ def generate(args):
         args.method,
         block_size=args.block_size,
         channel_group_size=args.kv_channel_group_size,
-        asym=args.kv_asym or None,
+        asym=args.kv_asym,
         clip_ratio=args.kv_clip_ratio,
     )
     if quantizer is not None:
@@ -888,10 +888,11 @@ def _parse_args():
     )
     quant_group.add_argument(
         "--kv_asym",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help=(
             "QuaRot only: asymmetric KV quantization (--k_asym/--v_asym "
-            "upstream, off by default)"
+            "upstream). On by default, following the QuaRot paper's KV setting"
         ),
     )
     quant_group.add_argument(
@@ -900,7 +901,7 @@ def _parse_args():
         default=None,
         help=(
             "QuaRot only: shrink the quantization range (--k_clip_ratio "
-            "upstream, 1.0 by default)"
+            "upstream). 0.95 by default, following the QuaRot paper"
         ),
     )
     quant_group.add_argument(

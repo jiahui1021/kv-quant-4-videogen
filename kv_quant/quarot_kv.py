@@ -23,6 +23,7 @@ from .utils import (
     fwht_last_dim,
     quarot_dequantize,
     quarot_find_params,
+    quarot_find_params_groupwise,
     quarot_quantize,
     timed,
 )
@@ -44,8 +45,16 @@ class QuaRotKVQuantizer(KVQuantizer):
       cache the rotated V and undo the rotation on the attention output --
       attention is linear in V, so ``H(sum_j a_j v_j) == sum_j a_j (H v_j)``.
     * Both caches are quantized per token (``ActQuantizer`` only supports
-      per-token), symmetric by default, over one group of ``head_dim``
-      channels or over the whole hidden size.
+      per-token), over one group of ``head_dim`` channels or over the whole
+      hidden size.  K always goes through ``find_params`` with
+      ``groupsize=-1`` (head-wise K is reshaped to ``[-1, head_dim]`` rows
+      first), whose range is widened to include zero.  V is ``v_proj``'s
+      output quantizer, so head-wise V takes
+      ``find_params_per_token_groupwise`` and its range is *not* widened.
+
+    Defaults follow the paper's KV setting (Section 5: "asymmetric
+    quantization with a group size 128 with a constant clipping ratio of
+    0.95"), with group size ``head_dim`` (128 for Wan and LongCat).
 
     ``materialize_kv`` therefore returns tensors in *attention space* when the
     state says so: the caller must rotate Q with :meth:`prepare_attention_qk`
@@ -66,8 +75,8 @@ class QuaRotKVQuantizer(KVQuantizer):
         value_bits: int | None = None,
         name: str | None = None,
         channel_group_size: int | None = None,
-        asym: bool = False,
-        clip_ratio: float = 1.0,
+        asym: bool = True,
+        clip_ratio: float = 0.95,
         rotate_value: bool = True,
     ) -> None:
         key_bits = bits if key_bits is None else key_bits
@@ -144,9 +153,15 @@ class QuaRotKVQuantizer(KVQuantizer):
         group = self._resolve_group(d, h)
         return x.reshape(b, l, (h * d) // group, group)
 
-    def _quantize_rotated(self, x: torch.Tensor, bits: int) -> Dict[str, Any]:
+    def _quantize_rotated(
+        self, x: torch.Tensor, bits: int, *, is_value: bool = False
+    ) -> Dict[str, Any]:
         xg = self._grouped(x)
-        scale, zero = quarot_find_params(xg, bits, self.sym, self.clip_ratio)
+        if is_value and self.channel_group_size != self.TOKEN_WISE_GROUP:
+            find_params = quarot_find_params_groupwise
+        else:
+            find_params = quarot_find_params
+        scale, zero = find_params(xg, bits, self.sym, self.clip_ratio)
         q = quarot_quantize(xg, scale, zero, bits, self.sym)
         state = {
             "q": pack_bits(q, bits, signed=self.sym),
@@ -212,7 +227,7 @@ class QuaRotKVQuantizer(KVQuantizer):
         if write_k.shape[1] == 0:
             return
         k_state = self._quantize_rotated(write_k, self.key_bits)
-        v_state = self._quantize_rotated(write_v, self.value_bits)
+        v_state = self._quantize_rotated(write_v, self.value_bits, is_value=True)
         tensor_dtype = meta.get("tensor_dtype", write_k.dtype)
         k_state["tensor_dtype"] = tensor_dtype
         v_state["tensor_dtype"] = tensor_dtype
@@ -347,7 +362,7 @@ class QuaRotKVQuantizer(KVQuantizer):
         rotated_k, rotated_v = self._rotate_new_kv(k, v, already_rotated)
         with timed(k.device, enabled=self.stats.timing_enabled) as timer:
             k_state = self._quantize_rotated(rotated_k, self.key_bits)
-            v_state = self._quantize_rotated(rotated_v, self.value_bits)
+            v_state = self._quantize_rotated(rotated_v, self.value_bits, is_value=True)
             tensor_dtype = meta.get("tensor_dtype", k.dtype)
             k_state["tensor_dtype"] = tensor_dtype
             v_state["tensor_dtype"] = tensor_dtype

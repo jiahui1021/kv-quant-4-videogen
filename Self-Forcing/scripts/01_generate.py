@@ -46,7 +46,7 @@ def _quarot_kwargs(
     """QuaRot's range knobs, which RTN and KIVI reject rather than ignore."""
     requested = {
         "--kv-channel-group-size": channel_group_size,
-        "--kv-asym": asym or None,
+        "--kv-asym": asym,
         "--kv-clip-ratio": clip_ratio,
     }
     if base != "QUAROT_KV":
@@ -60,8 +60,8 @@ def _quarot_kwargs(
     extra: Dict[str, object] = {}
     if channel_group_size is not None:
         extra["channel_group_size"] = int(channel_group_size)
-    if asym:
-        extra["asym"] = True
+    if asym is not None:
+        extra["asym"] = bool(asym)
     if clip_ratio is not None:
         extra["clip_ratio"] = float(clip_ratio)
     return extra
@@ -1199,11 +1199,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--kv-asym",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help=(
-            "QuaRot only: asymmetric KV quantization (--k_asym/--v_asym upstream, "
-            "off by default). Worth setting at INT2, where the symmetric range "
-            "leaves only three usable codes"
+            "QuaRot only: asymmetric KV quantization (--k_asym/--v_asym upstream). "
+            "On by default, following the QuaRot paper's KV setting"
         ),
     )
     parser.add_argument(
@@ -1211,8 +1211,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help=(
-            "QuaRot only: shrink the quantization range (--k_clip_ratio upstream, "
-            "1.0 by default). Trades tail clipping for resolution near zero"
+            "QuaRot only: shrink the quantization range (--k_clip_ratio upstream). "
+            "0.95 by default, following the QuaRot paper"
         ),
     )
     parser.add_argument(

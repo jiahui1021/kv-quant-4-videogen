@@ -22,11 +22,9 @@ PROMPT_FILE="${PROMPT_FILE:-${ROOT_DIR}/prompts/MovieGenVideoBench_extended.txt}
 # where 06_run_baseline_matrix.sh would have put them.
 BF16_DIR="${BF16_DIR:-${RUN_ROOT}/videos/BF16}"
 
-# QuaRot's symmetric absmax step equals the group maximum, so at two bits only
-# three of the four codes are reachable and most channels round to zero.  These
-# are upstream QuaRot's own knobs (--k_asym / --k_clip_ratio); leave them empty
-# to reproduce the stock symmetric configuration instead.
-QUAROT_INT2_ARGS="${QUAROT_INT2_ARGS:---kv-asym --kv-clip-ratio 0.5}"
+# QuaRot INT2 uses the paper's KV setting (asymmetric, group head_dim, clip 0.95),
+# which is the quantizer default.  Extra QuaRot knobs can still be passed here.
+QUAROT_INT2_ARGS="${QUAROT_INT2_ARGS:-}"
 
 RUN_VBENCH="${RUN_VBENCH:-1}"
 RUN_FIDELITY="${RUN_FIDELITY:-1}"

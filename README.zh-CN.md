@@ -11,7 +11,7 @@
 | `BF16` | 16 | 完整精度 KV cache |
 | `RTN_INT4` / `RTN_INT2` | 4 / 2 | Round-to-nearest 对称量化 |
 | `KIVI_INT4` / `KIVI_INT2` | 4 / 2 | KIVI 风格的 K/V 非对称量化 |
-| `QUAROT_KV_INT4` / `QUAROT_KV_INT2` | 4 / 2 | KV-only QuaRot：RoPE 之后对 Q/K 做同一个 Hadamard 旋转，V 做 head_dim 大小的旋转并在 attention 输出处还原，对称 per-token 量化 |
+| `QUAROT_KV_INT4` / `QUAROT_KV_INT2` | 4 / 2 | KV-only QuaRot：RoPE 之后对 Q/K 做同一个 Hadamard 旋转，V 做 head_dim 大小的旋转并在 attention 输出处还原，非对称 per-token、`head_dim` 分组、clip ratio 0.95（论文 KV 设置） |
 | `HADAMARD_K_INT4` / `HADAMARD_K_INT2` | 4 / 2 | 去掉 V 旋转的 QuaRot 消融，不作为 baseline 汇报 |
 | `QVG_INT2` / `QVG_INT4` | 2 / 4 | 官方 Quant-VideoGen semantic smoothing + progressive residual quantization（仅 Causal-Forcing） |
 
@@ -19,23 +19,24 @@
 generation chunk 的独立 schedule。LongCat 和 Causal-Forcing 共同调用根目录
 [`kv_quant/`](kv_quant/) 中的共享实现，QVG 专用代码放在 Causal-Forcing adapter 中。
 
-三个 baseline 各自遵循自己的参考实现，而不是共用一套量化器：RTN 与 QuaRot 是对称的
-（QuaRot 的 `--k_asym`/`--v_asym` 默认关闭），KIVI 是非对称的；QuaRot 的分组固定为一个
-`head_dim`（其 `QKRotationWrapper` 只接受 token-wise 或 `head_dim` 分组），而 RTN 用
-`block_size`。要在同一粒度下对比 RTN 与 QuaRot，请设置 `--block_size 128`。
+三个 baseline 各自遵循自己的参考实现，而不是共用一套量化器：RTN 是对称的，KIVI 与
+QuaRot 是非对称的（QuaRot 按论文 KV 设置）；QuaRot 的分组固定为一个 `head_dim`（其
+`QKRotationWrapper` 只接受 token-wise 或 `head_dim` 分组），而 RTN 用 `block_size`。
+要在同一粒度下对比 RTN 与 QuaRot，请设置 `--block_size 128`。
 
 QuaRot 需要 post-RoPE 的 key，因此 Causal-Forcing 把它路由到专用的
-`_attention_with_quarot_cache`，而不是共享的 pre-RoPE 缓存路径。
+`_attention_with_quarot_cache`，而不是共享的 pre-RoPE 缓存路径；Self-Forcing 的 patch
+也和 KIVI 一样只追加不重量化（clip ratio 小于 1 时反复重量化历史会让量程每次去噪都缩小）。
 
-QuaRot 的两个量程旋钮已接到 CLI：`--kv_asym`（官方 `--k_asym`/`--v_asym`）和
-`--kv_clip_ratio`（官方 `--k_clip_ratio`/`--v_clip_ratio`），另有
-`--kv_channel_group_size` 用于切到 token-wise（`-1`）分组。它们只对旋转后端有效，
-RTN / KIVI 传入会直接报错而不是静默忽略。
+QuaRot 默认采用论文的 KV 设置（第 5 节："asymmetric quantization with a group size 128
+with a constant clipping ratio of 0.95"；分组为一个 `head_dim`，Wan 与 LongCat 均为 128）。
+CLI 旋钮：`--kv_asym/--no-kv_asym`（官方 `--k_asym`/`--v_asym`）、`--kv_clip_ratio`
+（官方 `--k_clip_ratio`/`--v_clip_ratio`），另有 `--kv_channel_group_size` 用于切到
+token-wise（`-1`）分组。它们只对旋转后端有效，RTN / KIVI 传入会直接报错而不是静默忽略。
 
-INT2 下默认配置并不合适：对称 absmax 的步长等于组内最大值，4 个码字只有 3 个可达，
-且多数通道会被舍入到 0。`--kv_asym --kv_clip_ratio 0.5` 能挽回大部分损失。官方
-QuaRot 本身没有 2-bit 路径（packing 与 CUDA kernel 全是 `i4`），因此任何 INT2 的
-QuaRot 结果都属于外推，汇报时需注明。
+INT2 沿用同一设置，与论文附录 A.3 的 KV cache 消融一致（group-wise 非对称，group size
+128）。官方真实 packing 与 CUDA kernel 只有 `i4`，因此 INT2 QuaRot 是 fake-quant 精度
+加本仓库的 bit packing。
 
 
 ## 目录结构

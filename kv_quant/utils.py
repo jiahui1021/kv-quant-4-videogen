@@ -156,6 +156,35 @@ def quarot_find_params(
     return scale, zero
 
 
+def quarot_find_params_groupwise(
+    x: torch.Tensor,
+    bits: int,
+    sym: bool,
+    clip_ratio: float = 1.0,
+):
+    """QuaRot ``ActQuantizer.find_params_per_token_groupwise``.
+
+    This is the branch ``find_params`` takes when ``groupsize > 0``, which is
+    how ``v_proj``'s output quantizer runs with ``--v_groupsize head_dim``.
+    Unlike the per-token branch, the range is **not** widened to include zero.
+    """
+    _, maxq = quarot_minq_maxq(bits, sym)
+    work = x.float()
+    xmax = work.amax(dim=-1, keepdim=True) * clip_ratio
+    xmin = work.amin(dim=-1, keepdim=True) * clip_ratio
+    if sym:
+        xmax = torch.maximum(xmin.abs(), xmax)
+        scale = xmax / maxq
+        scale = torch.where(xmax == 0, torch.ones_like(scale), scale)
+        return scale, torch.zeros_like(scale)
+    degenerate = (xmin == 0) & (xmax == 0)
+    xmin = torch.where(degenerate, -torch.ones_like(xmin), xmin)
+    xmax = torch.where(degenerate, torch.ones_like(xmax), xmax)
+    scale = (xmax - xmin) / maxq
+    zero = torch.round(-xmin / scale)
+    return scale, zero
+
+
 def quarot_quantize(
     x: torch.Tensor,
     scale: torch.Tensor,

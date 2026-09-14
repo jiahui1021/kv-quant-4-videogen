@@ -83,11 +83,11 @@ parser.add_argument(
 )
 parser.add_argument(
     "--kv_asym",
-    action="store_true",
+    action=argparse.BooleanOptionalAction,
+    default=None,
     help=(
-        "QuaRot only: asymmetric KV quantization (--k_asym/--v_asym upstream, "
-        "off by default). Worth setting at INT2, where the symmetric range "
-        "leaves only three usable codes"
+        "QuaRot only: asymmetric KV quantization (--k_asym/--v_asym upstream). "
+        "On by default, following the QuaRot paper's KV setting"
     ),
 )
 parser.add_argument(
@@ -96,7 +96,8 @@ parser.add_argument(
     default=None,
     help=(
         "QuaRot only: shrink the quantization range (--k_clip_ratio upstream, "
-        "1.0 by default). Trades tail clipping for resolution near zero"
+        "0.95 by default, following the QuaRot paper). Trades tail clipping "
+        "for resolution near zero"
     ),
 )
 parser.add_argument(
@@ -307,7 +308,7 @@ else:
         args.method,
         block_size=args.block_size,
         channel_group_size=args.kv_channel_group_size,
-        asym=args.kv_asym or None,
+        asym=args.kv_asym,
         clip_ratio=args.kv_clip_ratio,
     )
 
