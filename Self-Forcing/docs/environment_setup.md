@@ -2,9 +2,10 @@
 
 ## Inference environment (`qvg_sf_infer`)
 
+Self-Forcing is vendored in `third_party/Self-Forcing` with the KV-cache
+quantization already integrated (see its `UPSTREAM.md`).
+
 ```bash
-./scripts/10_clone_deps.sh
-./scripts/11_apply_self_forcing_patch.sh
 conda create -n qvg_sf_infer python=3.10 -y
 conda activate qvg_sf_infer
 pip install --upgrade pip

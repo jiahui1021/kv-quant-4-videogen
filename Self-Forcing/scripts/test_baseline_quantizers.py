@@ -204,14 +204,16 @@ def _kivi_regressions() -> dict:
 
 
 def _self_forcing_patch_regression() -> dict:
-    patch_path = (
+    model_path = (
         REPO_ROOT
         / "Self-Forcing"
-        / "docs"
-        / "patches"
-        / "self_forcing_kv_quant.patch"
+        / "third_party"
+        / "Self-Forcing"
+        / "wan"
+        / "modules"
+        / "causal_model.py"
     )
-    text = patch_path.read_text(encoding="utf-8")
+    text = model_path.read_text(encoding="utf-8")
     required = (
         # Methods without an incremental cache: active-prefix requantization.
         'cache_k[:, :local_end_index]',
@@ -228,7 +230,7 @@ def _self_forcing_patch_regression() -> dict:
     missing = [snippet for snippet in required if snippet not in text]
     if missing:
         raise AssertionError(
-            "Self-Forcing patch does not preserve the expected cache semantics: "
+            "Vendored Self-Forcing causal_model.py does not preserve the expected cache semantics: "
             + ", ".join(missing)
         )
     return {

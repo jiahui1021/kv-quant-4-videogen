@@ -1,10 +1,10 @@
 """Block-boundary resident-byte sampling for the Self-Forcing KV quantizers.
 
-This repository's integration lives in the attention layer: the patch in
-``docs/patches/self_forcing_kv_quant.patch`` dequantizes on read and quantizes
-on write inside ``CausalWanSelfAttention``.  The pipeline's block loop is in
-unpatched upstream code, so there is no block hook available without extending
-that patch.
+This repository's integration lives in the attention layer: the vendored
+``third_party/Self-Forcing/wan/modules/causal_model.py`` dequantizes on read and
+quantizes on write inside ``CausalWanSelfAttention``.  The pipeline's block loop
+is unmodified upstream code, so there is no block hook available without
+changing it as well.
 
 The wrapper below reconstructs the boundary instead: ``quantize_kv`` (or
 ``append_kv`` on the incremental KIVI path) is called once per layer per

@@ -32,6 +32,8 @@ wan_models/*
 .DS_Store
 tmp/
 
-# Third-party clones (recreated via scripts)
+# Third-party clones (recreated via scripts/10_clone_deps.sh)
 third_party/*
 !third_party/.gitkeep
+# Self-Forcing is vendored with the KV-quant integration (see its UPSTREAM.md)
+!third_party/Self-Forcing/
