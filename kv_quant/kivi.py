@@ -402,8 +402,11 @@ class KIVIQuantizer(KVQuantizer):
         tensor_dtype = meta.get("tensor_dtype", write_k.dtype)
         self._append_k_state(state, buffered_k[:, :k_flush], tensor_dtype)
         self._append_v_state(state, buffered_v[:, :v_flush], tensor_dtype)
-        state["residual_k"] = buffered_k[:, k_flush:].contiguous()
-        state["residual_v"] = buffered_v[:, v_flush:].contiguous()
+        # ``clone`` rather than ``contiguous``: for batch 1 the tail slice is
+        # already contiguous, so ``contiguous`` would return a view that keeps
+        # the whole BF16 buffer (e.g. LongCat's full condition K/V) alive.
+        state["residual_k"] = buffered_k[:, k_flush:].clone()
+        state["residual_v"] = buffered_v[:, v_flush:].clone()
         self._sync_state(state)
 
     def init_state(self, meta: Dict[str, Any] | None = None) -> Dict[str, Any]:
@@ -581,9 +584,11 @@ class KIVIQuantizer(KVQuantizer):
         q_shape = list(int(dim) for dim in tensor_state["q_shape"])
         if groups <= 0 or groups >= q_shape[1]:
             raise ValueError("Partial KIVI K slice must leave at least one group")
-        tensor_state["q"] = tensor_state["q"][:, groups:].contiguous()
-        tensor_state["scale"] = tensor_state["scale"][:, groups:].contiguous()
-        tensor_state["zero"] = tensor_state["zero"][:, groups:].contiguous()
+        # ``clone`` so the evicted prefix is actually released (a contiguous
+        # tail slice would stay a view of the original payload).
+        tensor_state["q"] = tensor_state["q"][:, groups:].clone()
+        tensor_state["scale"] = tensor_state["scale"][:, groups:].clone()
+        tensor_state["zero"] = tensor_state["zero"][:, groups:].clone()
         q_shape[1] -= groups
         tensor_state["q_shape"] = tuple(q_shape)
         tensor_state["q_numel"] = math.prod(q_shape)
@@ -601,9 +606,9 @@ class KIVIQuantizer(KVQuantizer):
         q_shape = list(int(dim) for dim in tensor_state["q_shape"])
         if tokens <= 0 or tokens >= q_shape[1]:
             raise ValueError("Partial KIVI V slice must leave at least one token")
-        tensor_state["q"] = tensor_state["q"][:, tokens:].contiguous()
-        tensor_state["scale"] = tensor_state["scale"][:, tokens:].contiguous()
-        tensor_state["zero"] = tensor_state["zero"][:, tokens:].contiguous()
+        tensor_state["q"] = tensor_state["q"][:, tokens:].clone()
+        tensor_state["scale"] = tensor_state["scale"][:, tokens:].clone()
+        tensor_state["zero"] = tensor_state["zero"][:, tokens:].clone()
         q_shape[1] -= tokens
         tensor_state["q_shape"] = tuple(q_shape)
         tensor_state["q_numel"] = math.prod(q_shape)
@@ -640,7 +645,7 @@ class KIVIQuantizer(KVQuantizer):
         residual_tensor = state.get(residual)
         if remaining > 0 and isinstance(residual_tensor, torch.Tensor):
             take = min(remaining, int(residual_tensor.shape[1]))
-            state[residual] = residual_tensor[:, take:].contiguous()
+            state[residual] = residual_tensor[:, take:].clone()
             remaining -= take
             removed += take
         return removed

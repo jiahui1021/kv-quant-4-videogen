@@ -324,11 +324,11 @@ class Attention(nn.Module):
                     ).contiguous()
                 elif post_rope_cache:
                     # ``k_cache`` was captured after rope_3d at the condition
-                    # frames, so only the new keys are taken from ``k_roped``.
+                    # frames, so the re-roped prefix of ``k_roped`` is
+                    # overwritten in place instead of concatenating a new K.
                     cached_len = k_cache.shape[2]
-                    k_full = torch.cat(
-                        [k_cache, k_roped[:, :, cached_len:]], dim=2
-                    ).contiguous()
+                    k_roped[:, :, :cached_len].copy_(k_cache)
+                    k_full = k_roped
                 else:
                     k_full = k_roped
 

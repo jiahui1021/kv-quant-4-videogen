@@ -91,14 +91,34 @@ def is_shared_quant_cache(obj: Any) -> bool:
     return isinstance(obj, dict) and obj.get("format") == FORMAT_NAME and "state" in obj
 
 
-def move_state_to(obj: Any, device: torch.device | str) -> Any:
-    """Recursively move tensors in a quantized payload without touching metadata."""
+def move_state_to(obj: Any, device: torch.device | str, _memo: dict | None = None) -> Any:
+    """Recursively move tensors in a quantized payload without touching metadata.
+
+    Quantizer states alias sub-objects (KIVI keeps ``segments``/``k``/``v``
+    as aliases of ``k_segments``/``v_segments``), so every object is moved
+    once and its aliases share the result; otherwise a cross-device move
+    would store each packed payload several times.
+    """
+    memo = {} if _memo is None else _memo
+    key = id(obj)
+    if key in memo:
+        return memo[key]
     if isinstance(obj, torch.Tensor):
-        return obj.to(device)
-    if isinstance(obj, dict):
-        return {key: move_state_to(value, device) for key, value in obj.items()}
-    if isinstance(obj, list):
-        return [move_state_to(value, device) for value in obj]
-    if isinstance(obj, tuple):
-        return tuple(move_state_to(value, device) for value in obj)
-    return obj
+        moved = obj.to(device)
+    elif isinstance(obj, dict):
+        moved = {}
+        memo[key] = moved
+        for name, value in obj.items():
+            moved[name] = move_state_to(value, device, memo)
+        return moved
+    elif isinstance(obj, list):
+        moved = []
+        memo[key] = moved
+        moved.extend(move_state_to(value, device, memo) for value in obj)
+        return moved
+    elif isinstance(obj, tuple):
+        moved = tuple(move_state_to(value, device, memo) for value in obj)
+    else:
+        return obj
+    memo[key] = moved
+    return moved
