@@ -7,8 +7,9 @@ EVAL_PYTHON="${EVAL_PYTHON:-/home/suraj/miniforge3/envs/qvg_sf_eval/bin/python}"
 RUN_ROOT="${RUN_ROOT:-${ROOT_DIR}/results}"
 GPU_ID="${GPU_ID:-2}"
 MAX_PROMPTS="${MAX_PROMPTS:-}"
-NUM_OUTPUT_FRAMES="${NUM_OUTPUT_FRAMES:-42}"
+NUM_OUTPUT_FRAMES="${NUM_OUTPUT_FRAMES:-180}"
 SEED="${SEED:-0}"
+PROMPT_FILE="${PROMPT_FILE:-${ROOT_DIR}/prompts/moviegen_128.txt}"
 
 METHODS=(
   BF16
@@ -33,6 +34,7 @@ for method in "${METHODS[@]}"; do
     --seed "${SEED}" \
     --device cuda:0 \
     --use-ema \
+    --prompt-path "${PROMPT_FILE}" \
     --results-root "${RUN_ROOT}" \
     "${EXTRA_ARGS[@]}"
 
@@ -40,7 +42,7 @@ done
 
 for method in "${METHODS[@]}"; do
   echo "[vbench] ${method}"
-  CUDA_VISIBLE_DEVICES="${GPU_ID}" PYTHON_BIN="${EVAL_PYTHON}" RUN_ROOT="${RUN_ROOT}" "${ROOT_DIR}/scripts/03_eval_vbench.sh" "${method}" "${RUN_ROOT}/videos/${method}" "${ROOT_DIR}/prompts/MovieGenVideoBench_extended.txt" "${RUN_ROOT}/metrics/vbench_${method}" "${RUN_ROOT}/metrics/vbench_${method}.json"
+  CUDA_VISIBLE_DEVICES="${GPU_ID}" PYTHON_BIN="${EVAL_PYTHON}" RUN_ROOT="${RUN_ROOT}" "${ROOT_DIR}/scripts/03_eval_vbench.sh" "${method}" "${RUN_ROOT}/videos/${method}" "${PROMPT_FILE}" "${RUN_ROOT}/metrics/vbench_${method}" "${RUN_ROOT}/metrics/vbench_${method}.json"
 done
 
 for method in "${METHODS[@]}"; do

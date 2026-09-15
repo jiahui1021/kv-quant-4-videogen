@@ -126,7 +126,7 @@ parser.add_argument(
     "--local_attn_size",
     type=int,
     default=None,
-    help="Override the causal model attention window in latent frames",
+    help="Attention window in latent frames; unset or -1 keeps the full history, as in Tempokv",
 )
 parser.add_argument(
     "--retain_final_cache",
@@ -158,13 +158,19 @@ torch.set_grad_enabled(False)
 config = OmegaConf.load(args.config_path)
 default_config = OmegaConf.load(str(CAUSAL_ROOT / "configs/default_config.yaml"))
 config = OmegaConf.merge(default_config, config)
-if args.local_attn_size is not None:
-    if not hasattr(config, "model_kwargs") or config.model_kwargs is None:
-        config.model_kwargs = OmegaConf.create({})
-    config.model_kwargs.local_attn_size = int(args.local_attn_size)
+latent_frames = int(args.num_output_frames)
+# Unset or -1 keeps the full history, which is what Tempokv's -1 means.  The
+# causal model itself reads -1 as a 32760-token window: the last 21 latent frames.
+local_attn_size = (
+    latent_frames
+    if args.local_attn_size is None or args.local_attn_size == -1
+    else int(args.local_attn_size)
+)
+if not hasattr(config, "model_kwargs") or config.model_kwargs is None:
+    config.model_kwargs = OmegaConf.create({})
+config.model_kwargs.local_attn_size = local_attn_size
 
 num_frame_per_block = int(getattr(config, "num_frame_per_block", 1))
-latent_frames = int(args.num_output_frames)
 if latent_frames % num_frame_per_block:
     raise ValueError(
         "num_output_frames must be divisible by num_frame_per_block for the "
@@ -199,11 +205,7 @@ if qvg_enabled:
                     "chunkwise QVG schedule drifted: "
                     f"expected {expected_schedule}, got {observed_schedule}"
                 )
-effective_local_attn_size = int(
-    args.local_attn_size
-    if args.local_attn_size is not None
-    else getattr(config.model_kwargs, "local_attn_size", -1)
-)
+effective_local_attn_size = local_attn_size
 benchmark_config = {
     "method": args.method,
     "pixel_frames": latent_frames * 4 - 3,

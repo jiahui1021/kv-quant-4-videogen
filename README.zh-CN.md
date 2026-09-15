@@ -158,18 +158,18 @@ BF16 RTN_INT4 RTN_INT2 KIVI_INT4 KIVI_INT2 QUAROT_KV_INT4 QUAROT_KV_INT2
 python Causal-Forcing/inference.py \
   --config_path Causal-Forcing/configs/causal_forcing_dmd_framewise.yaml \
   --checkpoint_path /path/to/causal_forcing.pt \
-  --data_path Causal-Forcing/prompts/demos.txt \
+  --data_path Self-Forcing/prompts/moviegen_128.txt \
   --output_folder results/causal_forcing/RTN_INT4 \
   --num_output_frames 180 \
   --method RTN_INT4 \
-  --block_size 16 \
-  --use_ema
+  --block_size 16
 ```
 
 `--num_output_frames` 是 latent 帧数；180 latent 帧对应 717 像素帧
 （44.8s @ 16fps），与长视频 causal_forcing 结果对齐。
 
-文生视频使用 `Causal-Forcing/prompts/demos.txt` 等 prompt 文件。图生视频使用 `--i2v`，并传入原 Causal-Forcing loader 支持的图像 prompt 数据集。
+文生视频使用 `Self-Forcing/prompts/moviegen_128.txt`，与 Tempokv、QVG 的 MovieGen-128 相同；
+`--local_attn_size` 不设或设为 -1 时保留全部历史，与 Tempokv 一致。图生视频使用 `--i2v`，并传入原 Causal-Forcing loader 支持的图像 prompt 数据集。
 
 frame-wise 和 chunk-wise 模型通过 `--config_path` 选择，量化参数保持不变。
 
@@ -180,7 +180,7 @@ frame-wise 和 chunk-wise 模型通过 `--config_path` 选择，量化参数保�
 
 ```bash
 CHECKPOINT_PATH=/path/to/causal_forcing.pt \
-DATA_PATH=Causal-Forcing/prompts/demos.txt \
+DATA_PATH=Self-Forcing/prompts/moviegen_128.txt \
 bash Causal-Forcing/run_qvg.sh
 ```
 
@@ -193,7 +193,7 @@ chunkwise workload：717 pixel frames、180 latent frames、180-frame full-histo
 ```bash
 CONFIG_PATH=Causal-Forcing/configs/causal_forcing_dmd_chunkwise.yaml \
 CHECKPOINT_PATH=/path/to/causal_forcing.pt \
-DATA_PATH=Causal-Forcing/prompts/demos.txt \
+DATA_PATH=Self-Forcing/prompts/moviegen_128.txt \
 OUTPUT_ROOT=results/causal_forcing \
 bash Causal-Forcing/run_baseline_matrix.sh
 ```

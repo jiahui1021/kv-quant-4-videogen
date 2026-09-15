@@ -7,7 +7,8 @@ set -euo pipefail
 
 OUTPUT_ROOT="${OUTPUT_ROOT:-results/causal_forcing}"
 NUM_OUTPUT_FRAMES="${NUM_OUTPUT_FRAMES:-180}"
-LOCAL_ATTN_SIZE="${LOCAL_ATTN_SIZE:-180}"
+# -1 keeps the full history at any length, matching the Tempokv launcher.
+LOCAL_ATTN_SIZE="${LOCAL_ATTN_SIZE:--1}"
 RETAIN_FINAL_CACHE="${RETAIN_FINAL_CACHE:-1}"
 USE_EMA="${USE_EMA:-0}"
 PROFILE_QUANT_TIMING="${PROFILE_QUANT_TIMING:-0}"

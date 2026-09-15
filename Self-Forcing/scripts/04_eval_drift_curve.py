@@ -45,7 +45,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate long-horizon drift using VBench imaging_quality every N frames.")
     parser.add_argument("--method", required=True)
     parser.add_argument("--videos-dir", type=Path, required=True)
-    parser.add_argument("--prompt-file", type=Path, default=Path("prompts/MovieGenVideoBench_extended.txt"))
+    parser.add_argument("--prompt-file", type=Path, default=Path("prompts/moviegen_128.txt"))
     parser.add_argument("--frame-step", type=int, default=50)
     parser.add_argument("--max-frames", type=int, default=700)
     parser.add_argument("--work-dir", type=Path, default=Path("results/metrics/drift_work"))

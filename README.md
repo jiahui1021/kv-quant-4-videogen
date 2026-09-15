@@ -177,12 +177,11 @@ BF16 RTN_INT4 RTN_INT2 KIVI_INT4 KIVI_INT2 QUAROT_KV_INT4 QUAROT_KV_INT2
 python Causal-Forcing/inference.py \
   --config_path Causal-Forcing/configs/causal_forcing_dmd_framewise.yaml \
   --checkpoint_path /path/to/causal_forcing.pt \
-  --data_path Causal-Forcing/prompts/demos.txt \
+  --data_path Self-Forcing/prompts/moviegen_128.txt \
   --output_folder results/causal_forcing/RTN_INT4 \
   --num_output_frames 180 \
   --method RTN_INT4 \
-  --block_size 16 \
-  --use_ema
+  --block_size 16
 ```
 
 `--num_output_frames` is in latent frames; 180 latent frames produce 717
@@ -193,7 +192,7 @@ and run the launcher:
 
 ```bash
 CHECKPOINT_PATH=/path/to/causal_forcing.pt \
-DATA_PATH=Causal-Forcing/prompts/demos.txt \
+DATA_PATH=Self-Forcing/prompts/moviegen_128.txt \
 bash Causal-Forcing/run_qvg.sh
 ```
 
@@ -201,14 +200,15 @@ The default is QVG_INT2; use `METHOD=QVG_INT4` for INT4. The launcher uses the
 formal chunkwise workload (717 pixel frames / 180 latent frames / 180-frame
 full-history attention) and currently supports T2V only.
 
-For text-to-video, use a prompt file such as `Causal-Forcing/prompts/demos.txt`. For image-to-video, add `--i2v` and pass an image-prompt dataset supported by the original Causal-Forcing loader.
+For text-to-video, use `Self-Forcing/prompts/moviegen_128.txt`, the MovieGen-128 set Tempokv and QVG
+use. Leaving `--local_attn_size` unset or at -1 keeps the full history, as in Tempokv. For image-to-video, add `--i2v` and pass an image-prompt dataset supported by the original Causal-Forcing loader.
 
 ### 2. Run the complete Causal-Forcing matrix
 
 ```bash
 CONFIG_PATH=Causal-Forcing/configs/causal_forcing_dmd_chunkwise.yaml \
 CHECKPOINT_PATH=/path/to/causal_forcing.pt \
-DATA_PATH=Causal-Forcing/prompts/demos.txt \
+DATA_PATH=Self-Forcing/prompts/moviegen_128.txt \
 OUTPUT_ROOT=results/causal_forcing \
 bash Causal-Forcing/run_baseline_matrix.sh
 ```

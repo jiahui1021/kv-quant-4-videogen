@@ -277,7 +277,8 @@ def main() -> None:
     candidate_drift_json = run_root / "metrics" / f"drift_{args.method}.json"
     flowcache_layer_budget_path = run_root / "metrics" / "flowcache_profile_layer_budget.json"
     flowcache_profile_efficiency_path = run_root / "profile_pass" / "metrics" / "efficiency_FLOWCACHE_PROFILE.json"
-    prompt_file = REPO_ROOT / "prompts" / "MovieGenVideoBench_extended.txt"
+    # 01_generate.py is called without --prompt-path, so its default is the prompt set.
+    prompt_file = REPO_ROOT / "prompts" / "moviegen_128.txt"
     expected_outputs = expected_video_outputs(
         prompt_file,
         max_prompts=args.max_prompts,
@@ -414,7 +415,7 @@ def main() -> None:
                 "--videos-dir",
                 str(candidate_video_dir.relative_to(REPO_ROOT)),
                 "--prompt-file",
-                str((REPO_ROOT / "prompts" / "MovieGenVideoBench_extended.txt").relative_to(REPO_ROOT)),
+                str(prompt_file.relative_to(REPO_ROOT)),
                 "--output",
                 str(candidate_drift_json.relative_to(REPO_ROOT)),
             ]

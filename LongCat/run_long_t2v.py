@@ -250,6 +250,9 @@ def generate(args):
         cp_split_hw,
         enable_compile,
     )
+    # Same noise source as the Tempokv LongCat runtime: one CUDA generator seeded
+    # once and shared by every pipeline call, rather than the global RNG.
+    generator = torch.Generator(device=local_rank).manual_seed(seed)
     method_name, quantizer = parse_method(
         args.method,
         block_size=args.block_size,
@@ -288,6 +291,7 @@ def generate(args):
             num_frames=num_frames,
             num_inference_steps=50,
             guidance_scale=4.0,
+            generator=generator,
         )[0]
 
         if local_rank == 0:
@@ -379,6 +383,7 @@ def generate(args):
                 num_cond_frames=new_num_cond_frames,
                 num_inference_steps=50,
                 guidance_scale=4.0,
+                generator=generator,
                 use_kv_cache=True,
                 offload_kv_cache=args.offload_kv_cache,
                 enhance_hf=True,
@@ -480,6 +485,7 @@ def generate(args):
                 num_cond_frames=new_num_cond_frames,
                 num_inference_steps=50,
                 guidance_scale=4.0,
+                generator=generator,
                 use_kv_cache=True,
                 offload_kv_cache=args.offload_kv_cache,
                 enhance_hf=True,
@@ -573,6 +579,7 @@ def generate(args):
                 num_cond_frames=cur_num_cond_frames,
                 num_inference_steps=50,
                 spatial_refine_only=spatial_refine_only,
+                generator=generator,
             )[0]
 
             new_video = [
@@ -663,6 +670,7 @@ def generate(args):
                 num_cond_frames=cur_num_cond_frames,
                 num_inference_steps=50,
                 spatial_refine_only=spatial_refine_only,
+                generator=generator,
             )[0]
 
             new_video = [
@@ -753,13 +761,18 @@ def _parse_args():
     prompt_group.add_argument(
         "--prompt",
         type=str,
-        default="realistic filming style, a person wearing a dark helmet, a deep-colored jacket, blue jeans, and bright yellow shoes rides a skateboard along a winding mountain road. The skateboarder starts in a standing position, then gradually lowers into a crouch, extending one hand to touch the road surface while maintaining a low center of gravity to navigate a sharp curve. After completing the turn, the skateboarder rises back to a standing position and continues gliding forward. The background features lush green hills flanking both sides of the road, with distant snow-capped mountain peaks rising against a clear, bright blue sky. The camera follows closely from behind, smoothly tracking the skateboarder's movements and capturing the dynamic scenery along the route. The scene is shot in natural daylight, highlighting the vivid outdoor environment and the skateboarder's fluid actions.",
+        # Prompt and negative prompt defaults match the Tempokv LongCat runtime.
+        default="a cinematic video",
         help="Text prompt for video generation",
     )
     prompt_group.add_argument(
         "--negative_prompt",
         type=str,
-        default="Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards",
+        default=(
+            "Bright tones, overexposed, static, blurred details, subtitles, paintings, "
+            "still picture, worst quality, low quality, JPEG artifacts, deformed, "
+            "disfigured, misshapen limbs, fused fingers, messy background"
+        ),
         help="Negative text prompt for video generation",
     )
     prompt_group.add_argument(

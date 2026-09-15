@@ -750,6 +750,9 @@ def run(args: argparse.Namespace) -> None:
 
     set_seed(args.seed)
     low_memory = args.low_memory or get_cuda_free_memory_gb(device) < 40
+    # Attend over the whole history, as the Tempokv and QVG runners do.  The
+    # model's -1 default caps attention at 32760 tokens: the last 21 latent frames.
+    local_attn_size = args.num_output_frames if args.local_attn_size is None else args.local_attn_size
     pipeline = initialize_pipeline(
         config_path=args.config_path,
         default_config_path=args.default_config_path,
@@ -757,7 +760,7 @@ def run(args: argparse.Namespace) -> None:
         use_ema=args.use_ema,
         device=device,
         low_memory=low_memory,
-        local_attn_size=args.local_attn_size,
+        local_attn_size=local_attn_size,
     )
     attach_flowcache_native(pipeline, method_name, args)
     if quantizer is not None and hasattr(quantizer, "set_runtime_context"):
@@ -870,7 +873,9 @@ def run(args: argparse.Namespace) -> None:
 
     try:
         for prompt_id, prompt in prompts:
-            prompt_seed = args.seed + prompt_id
+            # Tempokv and QVG seed prompt i with seed + i * 1_000_003, so one prompt
+            # index draws the same noise in all three repositories.
+            prompt_seed = args.seed + prompt_id * 1_000_003
             set_seed(prompt_seed)
             reset_kv_state(pipeline, quantizer)
 
@@ -1259,8 +1264,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config-path", type=Path, default=SELF_FORCING_ROOT / "configs" / "self_forcing_dmd.yaml")
     parser.add_argument("--default-config-path", type=Path, default=SELF_FORCING_ROOT / "configs" / "default_config.yaml")
     parser.add_argument("--checkpoint-path", type=Path, default=REPO_ROOT / "checkpoints" / "self_forcing_dmd.pt")
-    parser.add_argument("--prompt-path", type=Path, default=REPO_ROOT / "prompts" / "MovieGenVideoBench_extended.txt")
-    parser.add_argument("--num-output-frames", type=int, default=42)
+    # MovieGen-128 at 180 latent frames (717 video frames) is the protocol the
+    # Tempokv and QVG Self-Forcing runners share.
+    parser.add_argument("--prompt-path", type=Path, default=REPO_ROOT / "prompts" / "moviegen_128.txt")
+    parser.add_argument("--num-output-frames", type=int, default=180)
     parser.add_argument("--num-samples", type=int, default=1)
     parser.add_argument("--max-prompts", type=int, default=None)
     parser.add_argument("--seed", type=int, default=0)
@@ -1270,7 +1277,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--local-attn-size",
         type=int,
         default=None,
-        help="Override the causal attention window in latent frames.",
+        help="Causal attention window in latent frames (default: the full history, --num-output-frames).",
     )
     parser.add_argument("--results-root", type=Path, default=REPO_ROOT / "results")
     parser.add_argument(

@@ -13,10 +13,10 @@ EVAL_PYTHON="${EVAL_PYTHON:-python}"
 RUN_ROOT="${RUN_ROOT:-${ROOT_DIR}/results}"
 GPU_ID="${GPU_ID:-0}"
 MAX_PROMPTS="${MAX_PROMPTS:-60}"
-NUM_OUTPUT_FRAMES="${NUM_OUTPUT_FRAMES:-42}"
+NUM_OUTPUT_FRAMES="${NUM_OUTPUT_FRAMES:-180}"
 SEED="${SEED:-0}"
 BLOCK_SIZE="${BLOCK_SIZE:-16}"
-PROMPT_FILE="${PROMPT_FILE:-${ROOT_DIR}/prompts/MovieGenVideoBench_extended.txt}"
+PROMPT_FILE="${PROMPT_FILE:-${ROOT_DIR}/prompts/moviegen_128.txt}"
 
 # Where the existing BF16 videos live.  Defaults to this run root, which is
 # where 06_run_baseline_matrix.sh would have put them.
