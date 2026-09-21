@@ -1,177 +1,80 @@
-# KV Quantization for LongCat and Causal-Forcing
+# KV-cache quantization baselines for video diffusion
 
-This repository provides one shared implementation of KV-cache quantization for LongCat and Causal-Forcing. The shared baselines are RTN, KIVI, and KV-only QuaRot (ported from `spcl/QuaRot`); Causal-Forcing additionally exposes the official QVG INT2 and INT4 baselines.
+RTN, KIVI and QuaRot KV-cache quantizers for Self-Forcing, Causal-Forcing and
+LongCat-Video, plus the official QVG baseline on Causal-Forcing. One
+implementation in [`kv_quant/`](kv_quant/), three model integrations.
 
-[中文说明](README.zh-CN.md)
+## Methods
 
-## Supported methods
+| Method | Quantizer |
+|---|---|
+| `BF16` | uncompressed reference |
+| `RTN_INT4` / `RTN_INT2` | per-token asymmetric round-to-nearest over channel groups of 64 |
+| `KIVI_INT4` / `KIVI_INT2` | keys per channel over token groups of 32, values per token, 128-token BF16 residual |
+| `QUAROT_KV_INT4` / `QUAROT_KV_INT2` | post-RoPE Hadamard on Q/K, head-sized Hadamard on V undone on the attention output, then asymmetric groups of 64 with clip ratio 0.95 |
+| `HADAMARD_K_INT4` / `HADAMARD_K_INT2` | QuaRot without the V rotation; an ablation, not a baseline |
+| `QVG_INT2` / `QVG_INT4` | official Quant-VideoGen, Causal-Forcing only |
 
-| Method | Bits | Description |
-|---|---:|---|
-| `BF16` | 16 | Full-precision KV cache |
-| `RTN_INT4` / `RTN_INT2` | 4 / 2 | Round-to-nearest symmetric quantization, per token/head over channel groups |
-| `KIVI_INT4` / `KIVI_INT2` | 4 / 2 | KIVI-style asymmetric quantization: keys per channel over token groups, values per token |
-| `QUAROT_KV_INT4` / `QUAROT_KV_INT2` | 4 / 2 | KV-only QuaRot: shared post-RoPE Hadamard on Q/K, head-sized Hadamard on V undone on the attention output, asymmetric per-token `head_dim` groups with clip ratio 0.95 (paper KV setting) |
-| `HADAMARD_K_INT4` / `HADAMARD_K_INT2` | 4 / 2 | QuaRot with the V rotation removed; a K-only ablation, not a baseline |
-| `QVG_INT2` / `QVG_INT4` | 2 / 4 | Official Quant-VideoGen semantic smoothing + progressive residual quantization (Causal-Forcing only) |
+RTN and QuaRot are charged the storage the paper's accounting uses, a BF16
+scale and an 8-bit zero point per group, so the two rows differ only by the
+rotation. KIVI keeps its own published parameterisation, a BF16 scale and a
+BF16 minimum per group of 32, which costs it half a bit per value and buys the
+accuracy that is the point of the method.
 
-Each baseline follows its own reference rather than a common quantizer: RTN
-is symmetric while KIVI and QuaRot are asymmetric (QuaRot per the paper's KV
-setting), and QuaRot's group is one `head_dim` (its `QKRotationWrapper`
-accepts only token-wise or `head_dim`-wise groups) while RTN's is `block_size`.
-Set `--block_size 128` to compare RTN and QuaRot at matched granularity.
+| | effective bits | compression |
+|---|---:|---:|
+| RTN, QuaRot INT4 | 4.375 | 3.66x |
+| RTN, QuaRot INT2 | 2.375 | 6.74x |
+| KIVI INT4 | 5.00 | 3.20x |
+| KIVI INT2 | 3.00 | 5.32x |
 
-QuaRot needs post-RoPE keys, so Causal-Forcing routes it to its own
-`_attention_with_quarot_cache` path instead of the shared pre-RoPE cache, and the
-Self-Forcing patch caches it append-only like KIVI (re-quantizing history with a
-clipping ratio below 1 would shrink its range on every denoising call).
+`--block_size` overrides the group size for every method, and
+`--kv_channel_group_size 128` puts QuaRot on its own paper's KV setting. FP8 is
+not used anywhere: the A100s these runs target have no FP8.
 
-QuaRot defaults to the paper's KV setting (Section 5: "asymmetric quantization
-with a group size 128 with a constant clipping ratio of 0.95"; the group is one
-`head_dim`, 128 for Wan and LongCat). The knobs are exposed as
-`--kv_asym/--no-kv_asym` (upstream `--k_asym`/`--v_asym`), `--kv_clip_ratio`
-(upstream `--k_clip_ratio`/`--v_clip_ratio`) and `--kv_channel_group_size` for the
-token-wise (`-1`) group. They apply to the rotated backends only; RTN and KIVI
-reject them instead of ignoring them.
+## Generation protocol
 
-The same setting is used at INT2, as in the paper's KV-cache ablation (Appendix
-A.3, group-wise asymmetric with group size 128). Upstream's real packing and CUDA
-kernels are `i4` only, so INT2 QuaRot is fake-quant precision with this
-repository's bit packing.
+Prompts, seeds, attention window and horizon match the Tempokv and QVG
+runners, so videos are comparable across the three repositories: MovieGen-128
+prompts, noise seed `seed + prompt_index * 1000003`, full-history attention,
+180 latent frames (717 pixel frames at 16 fps).
 
-The shared quantizers use `block_size=16` by default. QVG keeps the official
-`quant_block_size=64` and its own eight-chunk schedule. LongCat and
-Causal-Forcing call the shared implementation in [`kv_quant/`](kv_quant/);
-QVG-specific code stays in the Causal-Forcing adapter.
-
-## Directory layout
+## Layout
 
 ```text
-kv-quant-4-videogen/
-├── Forcing-KV/                       # Integrated Forcing-KV source snapshot
-├── kv_quant/                         # Shared RTN/KIVI/QuaRot implementation
-├── LongCat/
-│   ├── kv_quant_adapter.py           # LongCat [B,H,S,D] layout adapter
-│   ├── run_long_t2v.py               # LongCat generation entry point
-│   └── run_baseline_matrix.sh        # Run the shared seven methods
-├── Causal-Forcing/
-│   ├── kv_quant_runtime.py           # Causal cache setup and reset helpers
-│   ├── inference.py                  # Causal generation entry point
-│   ├── qvg_runtime.py                # Official QVG adapter and schedule
-│   └── run_baseline_matrix.sh        # Run shared methods plus QVG_INT2/INT4
-├── third_party/Quant-VideoGen/       # Pinned official QVG codec
-└── Self-Forcing/                     # Existing Self-Forcing implementation
+kv_quant/                     the quantizers, shared by all three models
+Self-Forcing/scripts/         generate, evaluate, summarize
+Causal-Forcing/               integration, inference.py, launchers
+LongCat/                      integration, run_long_t2v.py, launcher
+scripts/paper_experiments/    efficiency and latency runners
+third_party/Quant-VideoGen/   vendored QVG
 ```
 
-The integrated Forcing-KV source has a one-video Self-Forcing/Causal-Forcing
-717-frame smoke runner. It writes resident KV bytes and the corresponding
-BF16-equivalent compression ratio:
+## Install
 
 ```bash
-FORCING_KV_PRETRAINED_ROOT=/path/to/pretrained \
-SF_CHECKPOINT_PATH=/path/to/self_forcing.pt \
-CF_CHECKPOINT_PATH=/path/to/causal_forcing.pt \
-bash Forcing-KV/scripts/run_sf_cf_717.sh --only both
+pip install -r Self-Forcing/requirements-inference.txt   # generation
+pip install -r Self-Forcing/requirements-eval.txt        # VBench and fidelity
+pip install -r Causal-Forcing/requirements.txt           # Causal-Forcing
+pip install -r Causal-Forcing/requirements-qvg.txt       # QVG only
 ```
 
-Reports are written under `Forcing-KV/results/sf_cf_717/<workload>/efficiency/`.
-
-## Requirements
-
-The generation commands require a Linux environment with an NVIDIA GPU, a CUDA-enabled PyTorch installation, and the original model dependencies.
-
-For Causal-Forcing:
+## Self-Forcing
 
 ```bash
-cd Causal-Forcing
-conda create -n kv-quant python=3.10 -y
-conda activate kv-quant
-pip install -r requirements.txt
-pip install git+https://github.com/openai/CLIP.git
-pip install flash-attn --no-build-isolation
-python setup.py develop
-cd ..
-```
-
-LongCat additionally needs the dependencies used by its original runtime, including `diffusers`, `transformers`, `accelerate`, `safetensors`, `einops`, `triton`, `torchvision`, `Pillow`, `loguru`, `ftfy`, `regex`, `openai`, and `termcolor`. Install versions compatible with the installed CUDA and PyTorch versions.
-
-The LongCat source imports the existing `quant_videogen` runtime. If that runtime is kept outside this repository, expose it before running LongCat:
-
-```bash
-export PYTHONPATH=/path/to/Quant-VideoGen:$PYTHONPATH
-```
-
-Replace the path with the directory that contains the `quant_videogen/` package.
-
-## LongCat usage
-
-### 1. Generate one shared initial video
-
-LongCat continuation experiments must use the same initial video for every method. Generate it once with `BF16`, then reuse the resulting file:
-
-```bash
-torchrun --nproc_per_node=1 LongCat/run_long_t2v.py \
-  --workload 480p_init \
-  --context_parallel_size 1 \
-  --method BF16 \
-  --block_size 16 \
-  --quant_type none \
-  --checkpoint_dir /path/to/LongCat-checkpoint \
-  --output_dir results/longcat_init \
-  --prompt "A person walking through a sunlit forest"
-```
-
-With the default `--prompt_idx 0` and `--seed 0`, the initial video is written as `results/longcat_init/0-0.mp4`.
-
-### 2. Run one method
-
-```bash
-torchrun --nproc_per_node=1 LongCat/run_long_t2v.py \
-  --workload 480p_long_gen \
-  --context_parallel_size 1 \
+python Self-Forcing/scripts/01_generate.py \
   --method RTN_INT4 \
-  --block_size 16 \
-  --quant_type none \
-  --no_offload_kv_cache \
-  --checkpoint_dir /path/to/LongCat-checkpoint \
-  --init_video_path results/longcat_init/0-0.mp4 \
-  --num_segments 8 \
-  --num_frames 93 \
-  --num_cond_frames 53 \
-  --seed 0 \
-  --output_dir results/longcat/RTN_INT4 \
-  --prompt "A person walking through a sunlit forest"
+  --checkpoint-path /path/to/self_forcing_dmd.pt \
+  --results-root results
 ```
 
-Change only `--method` to compare the seven shared baselines. Keep the prompt, seed, initial video, frame settings, and context-parallel settings unchanged.
-
-For lower GPU memory usage, replace `--no_offload_kv_cache` with `--offload_kv_cache`.
-
-Do not combine the shared method with LongCat's legacy `--quant_type` quantizer. Use `--quant_type none` for all seven methods. This combination is invalid:
+All six baseline rows at INT4 and INT2, against an existing BF16 run:
 
 ```bash
---method RTN_INT2 --quant_type naive-int2
+BF16_DIR=results/videos/BF16 bash Self-Forcing/scripts/07_run_paper_baselines.sh
 ```
 
-### 3. Run the complete LongCat matrix
-
-```bash
-CHECKPOINT_DIR=/path/to/LongCat-checkpoint \
-INIT_VIDEO_PATH=results/longcat_init/0-0.mp4 \
-OUTPUT_ROOT=results/longcat \
-NPROC_PER_NODE=1 \
-bash LongCat/run_baseline_matrix.sh
-```
-
-The script runs:
-
-```text
-BF16 RTN_INT4 RTN_INT2 KIVI_INT4 KIVI_INT2 QUAROT_KV_INT4 QUAROT_KV_INT2
-```
-
-## Causal-Forcing usage
-
-### 1. Run one method
+## Causal-Forcing
 
 ```bash
 python Causal-Forcing/inference.py \
@@ -180,105 +83,44 @@ python Causal-Forcing/inference.py \
   --data_path Self-Forcing/prompts/moviegen_128.txt \
   --output_folder results/causal_forcing/RTN_INT4 \
   --num_output_frames 180 \
-  --method RTN_INT4 \
-  --block_size 16
+  --method RTN_INT4
 ```
 
-`--num_output_frames` is in latent frames; 180 latent frames produce 717
-pixel frames (44.8s @ 16fps), matching the long-video causal_forcing results.
+The whole matrix: `CONFIG_PATH=... CHECKPOINT_PATH=... DATA_PATH=...
+bash Causal-Forcing/run_baseline_matrix.sh`. QVG has its own launcher,
+`run_qvg.sh`, and needs `requirements-qvg.txt`.
 
-For QVG, install the dependencies in `Causal-Forcing/requirements-qvg.txt`
-and run the launcher:
+## LongCat
+
+Every continuation run starts from one shared initial video:
 
 ```bash
-CHECKPOINT_PATH=/path/to/causal_forcing.pt \
-DATA_PATH=Self-Forcing/prompts/moviegen_128.txt \
-bash Causal-Forcing/run_qvg.sh
+torchrun --nproc_per_node=1 LongCat/run_long_t2v.py \
+  --workload 480p_init --method BF16 --quant_type none \
+  --checkpoint_dir /path/to/LongCat-checkpoint \
+  --output_dir results/longcat_init \
+  --prompt "A person walking through a sunlit forest"
+
+torchrun --nproc_per_node=1 LongCat/run_long_t2v.py \
+  --workload 480p_long_gen --method RTN_INT4 --quant_type none \
+  --no_offload_kv_cache \
+  --checkpoint_dir /path/to/LongCat-checkpoint \
+  --init_video_path results/longcat_init/0-0.mp4 \
+  --num_segments 8 --seed 0 \
+  --output_dir results/longcat/RTN_INT4 \
+  --prompt "A person walking through a sunlit forest"
 ```
 
-The default is QVG_INT2; use `METHOD=QVG_INT4` for INT4. The launcher uses the
-formal chunkwise workload (717 pixel frames / 180 latent frames / 180-frame
-full-history attention) and currently supports T2V only.
+Change only `--method` between rows. The matrix launcher is
+`LongCat/run_baseline_matrix.sh`.
 
-For text-to-video, use `Self-Forcing/prompts/moviegen_128.txt`, the MovieGen-128 set Tempokv and QVG
-use. Leaving `--local_attn_size` unset or at -1 keeps the full history, as in Tempokv. For image-to-video, add `--i2v` and pass an image-prompt dataset supported by the original Causal-Forcing loader.
+## Metrics
 
-### 2. Run the complete Causal-Forcing matrix
+Each run writes `metrics/efficiency_<METHOD>.json` (Self-Forcing) or one
+report per run (Causal-Forcing, LongCat) with runtime, peak VRAM and the
+cache bytes. Compression is `resident_analytic.v1`: the BF16 cost of the cache
+positions actually held against the bytes resident at the same moment, never
+the preallocated capacity.
 
-```bash
-CONFIG_PATH=Causal-Forcing/configs/causal_forcing_dmd_chunkwise.yaml \
-CHECKPOINT_PATH=/path/to/causal_forcing.pt \
-DATA_PATH=Self-Forcing/prompts/moviegen_128.txt \
-OUTPUT_ROOT=results/causal_forcing \
-bash Causal-Forcing/run_baseline_matrix.sh
-```
-
-Set `USE_EMA=1` when the checkpoint contains EMA weights; the formal launcher
-defaults to the regular `generator` weights so it matches the Tempokv launcher.
-Set `PROFILE_QUANT_TIMING=1` only when the optional CUDA-event quantizer timing
-breakdown is needed; it is disabled by default for fair latency measurement.
-
-## Generation metrics
-
-Each completed video writes a JSON report containing at least:
-
-```json
-{
-  "method": "RTN_INT4",
-  "end_to_end_generation_time_s": 0.0,
-  "peak_vram_bytes": 0,
-  "peak_vram_gb": 0.0,
-  "quantize_calls": 0,
-  "dequantize_calls": 0
-}
-```
-
-LongCat reports are stored under:
-
-```text
-<output_dir>/<prompt_idx>-<seed>/metrics_<method>.json
-```
-
-Causal-Forcing reports are stored under:
-
-```text
-<output_folder>/metrics_<method>_<prompt_idx>.json
-```
-
-`diffusion_generation_s` is the comparable main latency: it starts before the
-autoregressive denoising loop and ends after the final clean refresh, before
-VAE decoding. `end_to_end_generation_time_s` is retained for compatibility and
-includes VAE decoding. `peak_vram_bytes` is the maximum CUDA memory allocated
-during that video generation. Quantized runs also fail if the quantizer was
-never called, preventing a mislabeled BF16 run.
-
-Per-quantizer timing is disabled by default so it does not add synchronization or event overhead to the latency benchmark. Enable the optional CUDA-event breakdown only when needed:
-
-```bash
---profile_quant_timing        # LongCat and Causal-Forcing
---profile-quant-timing        # Self-Forcing
-```
-
-Causal-Forcing generic baselines report resident cache capacity. QVG reports
-physical BF16 chunks, centroids, cluster IDs, packed residuals, scales and
-zero-points separately, together with `resident_total_kv_bytes`,
-`uncompressed_reference_kv_bytes`, effective bits/value, QVG configuration and
-the pinned upstream commit. QVG resident bytes include both packed tensors and
-the BF16 tail. Effective bits/value is computed as
-`resident_total_kv_bytes * 8 / resident_logical_kv_values`; it is a resident
-storage measurement, not the nominal INT2/INT4 setting.
-
-## Recommended validation order
-
-```text
-BF16 → RTN_INT4 → KIVI_INT4 → QUAROT_KV_INT4 → RTN_INT2 → KIVI_INT2 → QUAROT_KV_INT2 → QVG_INT2 → QVG_INT4
-```
-
-Start with `context_parallel_size=1`, no compilation, and the same initial video. Enable CPU offload, context parallelism, attention sinks, and local attention only after the basic matrix is working.
-
-## Troubleshooting
-
-- `ModuleNotFoundError: quant_videogen`: add the directory containing `quant_videogen/` to `PYTHONPATH`.
-- `Do not enable shared RTN/KIVI/QuaRot and legacy --quant_type`: set `--quant_type none`.
-- `KV quantization was never triggered`: use a cache-enabled LongCat continuation workload or the Causal-Forcing inference entry point, and confirm that the selected method is not `BF16`.
-- Out-of-memory during LongCat generation: use `--offload_kv_cache`, reduce `--num_segments`, or validate one segment first.
+Evaluation: `02_eval_fidelity.py` (PSNR/SSIM/LPIPS against BF16),
+`03_eval_vbench.sh` (VBench), `05_summarize_results.py` (tables).

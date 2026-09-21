@@ -20,11 +20,17 @@ from .incremental import (
 )
 from .packing import packed_bytes
 from .utils import (
+    COMPARISON_GROUP_SIZE,
+    SCALE_STORAGE_BYTES,
+    SCALE_STORAGE_DTYPE,
+    SIGNED_ZERO_STORAGE_DTYPE,
+    ZERO_STORAGE_BYTES,
     fwht_last_dim,
     quarot_dequantize,
     quarot_find_params,
     quarot_find_params_groupwise,
     quarot_quantize,
+    round_scale_to_storage,
     timed,
 )
 
@@ -66,6 +72,9 @@ class QuaRotKVQuantizer(KVQuantizer):
 
     #: QuaRot asserts ``k_groupsize in [-1, head_dim]``.
     TOKEN_WISE_GROUP = -1
+    #: Channels per scale in the shared comparison setting;
+    #: ``channel_group_size=head_dim`` reproduces QuaRot's own KV setting.
+    COMPARISON_GROUP = COMPARISON_GROUP_SIZE
     #: Implements init_state/append_kv/materialize_kv for an append-only cache.
     supports_incremental_cache = True
 
@@ -137,15 +146,24 @@ class QuaRotKVQuantizer(KVQuantizer):
     # -- quantization -----------------------------------------------------
 
     def _resolve_group(self, head_dim: int, num_heads: int) -> int:
+        """Channels that share one scale.
+
+        The Hadamard is always one ``head_dim`` block, which is what makes the
+        rotation exact; the quantizer's group is a separate choice.  The
+        default 64 is the shared comparison group, and ``head_dim`` reproduces
+        QuaRot's own KV setting.
+        """
         group = self.channel_group_size
         if group is None:
-            return int(head_dim)
+            return int(min(self.COMPARISON_GROUP, head_dim))
         if group == self.TOKEN_WISE_GROUP:
             return int(num_heads * head_dim)
-        if group not in (head_dim, num_heads * head_dim):
+        if group == num_heads * head_dim:
+            return int(group)
+        if group <= 0 or head_dim % group:
             raise ValueError(
-                "QuaRot supports token-wise (-1) or head-wise (head_dim) K/V "
-                f"groups only; got channel_group_size={group} for head_dim={head_dim}"
+                "QuaRot groups must be token-wise (-1) or divide head_dim; got "
+                f"channel_group_size={group} for head_dim={head_dim}"
             )
         return int(group)
 
@@ -191,19 +209,21 @@ class QuaRotKVQuantizer(KVQuantizer):
                 tensor_dtype = xc.dtype
             xg = self._grouped(xc)
             scale, zero = find_params(xg, bits, self.sym, self.clip_ratio)
+            scale = round_scale_to_storage(scale)
             q[:, start:start + chunk] = quarot_quantize(xg, scale, zero, bits, self.sym)
-            scales.append(scale.to(torch.float16))
+            scales.append(scale.to(SCALE_STORAGE_DTYPE))
             if not self.sym:
-                zeros.append(zero.to(torch.float16))
+                zeros.append(zero.clamp(-128, 127).to(SIGNED_ZERO_STORAGE_DTYPE))
             del xc, xg, scale, zero
-        empty_params = torch.empty((b, 0, groups, 1), dtype=torch.float16, device=x.device)
+        empty_scale = torch.empty((b, 0, groups, 1), dtype=SCALE_STORAGE_DTYPE, device=x.device)
+        empty_zero = torch.empty((b, 0, groups, 1), dtype=SIGNED_ZERO_STORAGE_DTYPE, device=x.device)
         state = {
             "q": pack_bits(q, bits, signed=self.sym),
             "q_shape": tuple(q.shape),
             "q_numel": int(q.numel()),
             "packed": True,
             "signed": self.sym,
-            "scale": torch.cat(scales, dim=1) if scales else empty_params,
+            "scale": torch.cat(scales, dim=1) if scales else empty_scale,
             "orig_shape": tuple(x.shape),
             "bits": bits,
             "sym": self.sym,
@@ -213,7 +233,7 @@ class QuaRotKVQuantizer(KVQuantizer):
             "tensor_dtype": tensor_dtype,
         }
         if not self.sym:
-            state["zero"] = torch.cat(zeros, dim=1) if zeros else empty_params.clone()
+            state["zero"] = torch.cat(zeros, dim=1) if zeros else empty_zero
         return state
 
     def _dequantize_rotated(self, state: Dict[str, Any]) -> torch.Tensor:
@@ -479,10 +499,12 @@ class QuaRotKVQuantizer(KVQuantizer):
         group = self._resolve_group(head_dim, num_heads)
         values = batch_size * active_tokens * num_heads * head_dim
         groups = batch_size * active_tokens * (num_heads * head_dim) // group
-        # fp16 scale, plus an fp16 zero point when asymmetric.
-        params_per_group = 2 if self.asym else 1
-        key_bytes = packed_bytes(values, self.key_bits) + groups * 2 * params_per_group
-        value_bytes = packed_bytes(values, self.value_bits) + groups * 2 * params_per_group
+        # A BF16 scale, plus an 8-bit zero point when asymmetric.
+        param_bytes = groups * (
+            SCALE_STORAGE_BYTES + (ZERO_STORAGE_BYTES if self.asym else 0)
+        )
+        key_bytes = packed_bytes(values, self.key_bits) + param_bytes
+        value_bytes = packed_bytes(values, self.value_bits) + param_bytes
         return int(key_bytes + value_bytes)
 
 

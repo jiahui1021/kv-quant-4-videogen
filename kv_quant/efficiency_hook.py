@@ -1,8 +1,19 @@
-"""Compatibility copy of the Self-Forcing block-boundary sampler.
+"""Block-boundary resident-byte sampling for the Self-Forcing KV quantizers.
 
-The top-level ``kv_quant`` package is importable before ``Self-Forcing`` during
-the repository's full test suite.  Keep the same transparent wrapper available
-there while the canonical runtime copy remains under ``Self-Forcing/kv_quant``.
+This repository's integration lives in the attention layer: the vendored
+``third_party/Self-Forcing/wan/modules/causal_model.py`` dequantizes on read and
+quantizes on write inside ``CausalWanSelfAttention``.  The pipeline's block loop
+is unmodified upstream code, so there is no block hook available without
+changing it as well.
+
+The wrapper below reconstructs the boundary instead: ``quantize_kv`` (or
+``append_kv`` on the incremental KIVI path) is called once per layer per
+block, so a wrap of the layer counter marks a new block.
+The sample is taken before the block's first layer is quantized and again
+after, which is the same dense/packed state the other two repositories sample.
+The equality gate in ``collect_efficiency.py`` -- every method's
+``peak_bf16_equivalent_bytes`` must equal the BF16 run's
+``peak_resident_bytes`` -- is what proves the reconstruction is correct.
 """
 
 from __future__ import annotations
@@ -14,7 +25,7 @@ from .base import KVQuantizer
 
 
 class SamplingQuantizer(KVQuantizer):
-    """Forward one quantizer while sampling before and after each block."""
+    """Transparent quantizer wrapper that samples the cache at block edges."""
 
     def __init__(
         self,
@@ -24,11 +35,15 @@ class SamplingQuantizer(KVQuantizer):
     ) -> None:
         if num_layers < 1:
             raise ValueError("num_layers must be at least 1")
+        # KVQuantizer.__init__ is deliberately not called: this class owns no
+        # quantization state of its own and forwards every setting to `inner`.
         self._inner = inner
         self._cache_getter = cache_getter
         self._num_layers = int(num_layers)
         self._layer_cursor = 0
         self.sampler = efficiency.ResidentSampler()
+
+    # -- pass-through -----------------------------------------------------
 
     @property
     def stats(self):
@@ -50,7 +65,9 @@ class SamplingQuantizer(KVQuantizer):
     def memory_bytes(self, state) -> int:
         return self._inner.memory_bytes(state)
 
-    def estimate_active_kv_bytes(self, active_tokens, batch_size, num_heads, head_dim) -> int:
+    def estimate_active_kv_bytes(
+        self, active_tokens, batch_size, num_heads, head_dim
+    ) -> int:
         return self._inner.estimate_active_kv_bytes(
             active_tokens=active_tokens,
             batch_size=batch_size,
@@ -67,7 +84,12 @@ class SamplingQuantizer(KVQuantizer):
             reset()
 
     def __getattr__(self, name: str) -> Any:
+        # Optional protocol members (finalize_state, reset_prompt_state, ...)
+        # reach the wrapped quantizer untouched.  Only consulted for attributes
+        # this class does not define, so it cannot shadow the methods above.
         return getattr(self._inner, name)
+
+    # -- sampling ---------------------------------------------------------
 
     def quantize_kv(self, k, v, meta=None):
         if self._layer_cursor == 0:
@@ -77,6 +99,8 @@ class SamplingQuantizer(KVQuantizer):
         return result
 
     def append_kv(self, state, new_k, new_v, meta=None):
+        # The incremental (KIVI) cache path writes through ``append_kv``
+        # instead of ``quantize_kv``, still once per layer per call.
         if self._layer_cursor == 0:
             self._sample()
         result = self._inner.append_kv(state, new_k, new_v, meta=meta)
@@ -94,6 +118,13 @@ class SamplingQuantizer(KVQuantizer):
         self.sampler.observe(resident, equivalent)
 
     def resident_kv_bytes(self) -> Tuple[int, int]:
+        """Resident bytes and BF16 equivalent, per ``resident_analytic.v1``.
+
+        Counts the packed ``quant_state``, the BF16 recent window some methods
+        keep unquantized, and any dense ``k``/``v`` buffer still allocated.
+        All are resident at the same time, so a figure built from only one of
+        them understates the cache.
+        """
         layers = list(self._cache_getter())
         if not layers:
             return 0, 0
@@ -104,20 +135,25 @@ class SamplingQuantizer(KVQuantizer):
                 resident += efficiency.tensor_bytes(block.get(key))
             end_index = block.get("local_end_index")
             tokens = max(tokens, int(end_index) if end_index is not None else 0)
-        first = layers[0]
-        geometry = first.get("k")
-        if geometry is None:
-            geometry = first.get("recent_k")
-        if geometry is not None and getattr(geometry, "ndim", 0) == 4:
-            batch, _, heads, head_dim = geometry.shape
-        else:
-            batch = int(first.get("batch_size", 0))
-            heads = int(first.get("num_heads", 0))
-            head_dim = int(first.get("head_dim", 0))
+        batch, heads, head_dim = _cache_geometry(layers[0])
         equivalent = efficiency.bf16_equivalent_bytes(
-            int(batch), tokens, int(heads), int(head_dim)
+            batch=batch, tokens=tokens, heads=heads, head_dim=head_dim
         ) * len(layers)
         return resident, equivalent
+
+
+def _cache_geometry(block: Dict[str, Any]) -> Tuple[int, int, int]:
+    """Batch, heads, and head dimension, from whichever tensor the block has."""
+    for key in ("k", "recent_k"):
+        tensor = block.get(key)
+        if tensor is not None and getattr(tensor, "ndim", 0) == 4:
+            batch, _, heads, head_dim = tensor.shape
+            return int(batch), int(heads), int(head_dim)
+    return (
+        int(block.get("batch_size", 0)),
+        int(block.get("num_heads", 0)),
+        int(block.get("head_dim", 0)),
+    )
 
 
 __all__ = ["SamplingQuantizer"]

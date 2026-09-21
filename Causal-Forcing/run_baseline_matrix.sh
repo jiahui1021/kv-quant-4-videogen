@@ -53,7 +53,7 @@ for method in "${METHODS[@]}"; do
       --qvg_num_prq_stages 1
     )
   else
-    method_args=(--method "${method}" --block_size 16)
+    method_args=(--method "${method}")
   fi
   [[ "$RETAIN_FINAL_CACHE" == 1 ]] && method_args+=(--retain_final_cache)
   [[ "$USE_EMA" == 1 ]] && method_args+=(--use_ema)

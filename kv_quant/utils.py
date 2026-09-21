@@ -45,20 +45,90 @@ def reshape_channel_groups(x: torch.Tensor, group_size: int) -> torch.Tensor:
     return x.reshape(b, l, h, d // group_size, group_size)
 
 
+#: Quantization parameters are stored the same way for every baseline and for
+#: TempoKV: a BF16 scale and a UINT8 zero point per group.  A row's compression
+#: ratio then reflects its grouping and bit width, not how it happens to encode
+#: its parameters.  FP8 is deliberately not used: the A100s these runs target
+#: have no FP8 support.
+SCALE_STORAGE_DTYPE = torch.bfloat16
+ZERO_STORAGE_DTYPE = torch.uint8
+#: QuaRot's group-wise branch keeps its own range instead of widening it to
+#: include zero, so its zero point can be negative.  Same eight bits, signed.
+SIGNED_ZERO_STORAGE_DTYPE = torch.int8
+SCALE_STORAGE_BYTES = 2
+ZERO_STORAGE_BYTES = 1
+
+#: Channels (or tokens) per scale in the shared comparison setting.
+COMPARISON_GROUP_SIZE = 64
+
+
+def round_scale_to_storage(scale: torch.Tensor) -> torch.Tensor:
+    """Round a scale to the precision the cache stores it at.
+
+    The codes are computed with the rounded scale, not the exact one: dividing
+    by a scale the cache cannot hold would bias every value in the group by the
+    rounding error.
+    """
+    return scale.to(SCALE_STORAGE_DTYPE).to(scale.dtype)
+
+
 def quantize_asym(
     x: torch.Tensor,
     bits: int,
     reduce_dims: Tuple[int, ...],
-    *,
-    parameter_dtype: torch.dtype = torch.float16,
 ):
+    """Asymmetric round-to-nearest with an integer zero point.
+
+    The zero point is the code that reconstructs to zero, which is what the
+    UINT8 field holds; storing the group minimum instead would need a second
+    floating-point tensor.  As in QuaRot's ``find_params``, the range is
+    widened to include zero so that the zero point stays inside the code
+    range.  Reconstruction is ``(q - zero) * scale``.
+    """
+    qmin, qmax = 0, (1 << bits) - 1
+    zeros = torch.zeros_like(x[(slice(None),) * x.ndim])
+    x_min = torch.minimum(x.amin(dim=reduce_dims, keepdim=True), zeros.amin(dim=reduce_dims, keepdim=True))
+    x_max = torch.maximum(x.amax(dim=reduce_dims, keepdim=True), zeros.amax(dim=reduce_dims, keepdim=True))
+    scale = ((x_max - x_min) / max(qmax - qmin, 1)).clamp_min(EPS)
+    scale = round_scale_to_storage(scale)
+    zero = torch.round(-x_min / scale).clamp(qmin, qmax)
+    q = torch.round(x / scale).add(zero).clamp(qmin, qmax).to(torch.int8)
+    return q, scale.to(SCALE_STORAGE_DTYPE), zero.to(ZERO_STORAGE_DTYPE)
+
+
+def quantize_asym_min_offset(
+    x: torch.Tensor,
+    bits: int,
+    reduce_dims: Tuple[int, ...],
+):
+    """KIVI's asymmetric quantization: a scale and the group minimum.
+
+    KIVI stores the minimum itself rather than an integer zero point, so a
+    group whose values never reach zero keeps its own range instead of being
+    widened down to it.  Both parameters are BF16, as in the reference
+    implementation, which costs one more byte per group than the shared
+    encoding.  Reconstruction is ``q * scale + minimum``.
+    """
     qmin, qmax = 0, (1 << bits) - 1
     x_min = x.amin(dim=reduce_dims, keepdim=True)
     x_max = x.amax(dim=reduce_dims, keepdim=True)
     scale = ((x_max - x_min) / max(qmax - qmin, 1)).clamp_min(EPS)
-    zero = x_min
-    q = torch.round((x - zero) / scale).clamp(qmin, qmax).to(torch.int8)
-    return q, scale.to(parameter_dtype), zero.to(parameter_dtype)
+    scale = round_scale_to_storage(scale)
+    minimum = x_min.to(SCALE_STORAGE_DTYPE)
+    q = torch.round((x - minimum.to(x.dtype)) / scale).clamp(qmin, qmax).to(torch.int8)
+    return q, scale.to(SCALE_STORAGE_DTYPE), minimum
+
+
+def dequantize_asym_min_offset(
+    q: torch.Tensor,
+    scale: torch.Tensor,
+    minimum: torch.Tensor,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    out = q.to(dtype, copy=True)
+    out.mul_(scale.to(dtype))
+    out.add_(minimum.to(dtype))
+    return out
 
 
 def dequantize_asym(
@@ -69,8 +139,8 @@ def dequantize_asym(
 ) -> torch.Tensor:
     # In place on one fresh copy: same arithmetic order, one full-size buffer.
     out = q.to(dtype, copy=True)
+    out.sub_(zero.to(dtype))
     out.mul_(scale.to(dtype))
-    out.add_(zero.to(dtype))
     return out
 
 
@@ -78,8 +148,9 @@ def quantize_sym(x: torch.Tensor, bits: int, reduce_dims: Tuple[int, ...]):
     qmax = (1 << (bits - 1)) - 1
     x_abs = x.abs().amax(dim=reduce_dims, keepdim=True)
     scale = (x_abs / max(qmax, 1)).clamp_min(EPS)
+    scale = round_scale_to_storage(scale)
     q = torch.round(x / scale).clamp(-qmax - 1, qmax).to(torch.int8)
-    return q, scale.to(torch.float16)
+    return q, scale.to(SCALE_STORAGE_DTYPE)
 
 
 def dequantize_sym(

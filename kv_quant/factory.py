@@ -21,7 +21,7 @@ SUPPORTED_METHODS = (
 def create_quantizer(
     method: str,
     bits: int,
-    block_size: int = 16,
+    block_size: int | None = None,
     key_bits: int | None = None,
     value_bits: int | None = None,
     name: str | None = None,
@@ -32,8 +32,18 @@ def create_quantizer(
     asym: bool | None = None,
     clip_ratio: float | None = None,
 ):
-    """Create one of the shared KV-cache quantizers."""
+    """Create one of the shared KV-cache quantizers.
+
+    ``block_size=None`` leaves every baseline at its own reference setting
+    (RTN channel groups of 128, KIVI group 32 with a 128-token BF16 residual,
+    QuaRot one ``head_dim`` group).  Passing a number overrides all of them at
+    once, which is a matched-granularity ablation rather than the paper rows.
+    """
     method = method.upper()
+    paper_block_size = block_size is None
+    # The exploratory methods below still take a number; only the three paper
+    # baselines carry a published grouping of their own.
+    block_size = 16 if block_size is None else int(block_size)
     # Each method exposes a different set of grouping knobs.  Silently
     # dropping one produces a quantizer that is not the configuration the
     # caller asked for, so an inapplicable option is refused here instead.
@@ -63,18 +73,18 @@ def create_quantizer(
 
         return RTNQuantizer(
             bits=bits,
-            block_size=block_size,
+            **({} if paper_block_size else {"block_size": block_size}),
             key_bits=key_bits,
             value_bits=value_bits,
             name=name,
-            channel_group_size=channel_group_size,
+            **({} if channel_group_size is None else {"channel_group_size": int(channel_group_size)}),
         )
     if method == "KIVI":
         from .kivi import KIVIQuantizer
 
         return KIVIQuantizer(
             bits=bits,
-            block_size=block_size,
+            **({} if paper_block_size else {"block_size": block_size}),
             key_bits=key_bits,
             value_bits=value_bits,
             name=name,
@@ -91,13 +101,14 @@ def create_quantizer(
             extra["asym"] = bool(asym)
         if clip_ratio is not None:
             extra["clip_ratio"] = float(clip_ratio)
+        if channel_group_size is not None:
+            extra["channel_group_size"] = int(channel_group_size)
         return cls(
             bits=bits,
-            block_size=block_size,
+            **({} if paper_block_size else {"block_size": block_size}),
             key_bits=key_bits,
             value_bits=value_bits,
             name=name,
-            channel_group_size=channel_group_size,
             **extra,
         )
     raise ValueError(f"Unsupported KV quantization method: {method}")
@@ -105,7 +116,7 @@ def create_quantizer(
 
 def parse_method(
     method: str,
-    block_size: int = 16,
+    block_size: int | None = None,
     channel_group_size: int | None = None,
     asym: bool | None = None,
     clip_ratio: float | None = None,
@@ -115,6 +126,8 @@ def parse_method(
     ``asym`` and ``clip_ratio`` are QuaRot's ``--k_asym``/``--k_clip_ratio``
     knobs and only apply to the rotated backends; passing them to RTN or KIVI
     is refused by :func:`create_quantizer` rather than ignored.
+
+    ``block_size=None`` keeps every baseline at its published grouping.
     """
     method = method.upper()
     if method == "BF16":

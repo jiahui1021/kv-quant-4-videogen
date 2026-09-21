@@ -134,37 +134,63 @@ def finalize_quantized_kv_cache(pipeline, quantizer=None) -> None:
             quantizer.finalize_state(state, meta={"tensor_dtype": dtype})
 
 
+def _resident_tokens(block: dict) -> int:
+    """Cache positions the block holds, never the size it was allocated at."""
+    state = block.get("quant_state")
+    if isinstance(state, dict) and state.get("num_tokens") is not None:
+        return int(state["num_tokens"])
+    end_index = block.get("local_end_index")
+    if isinstance(end_index, torch.Tensor):
+        return int(end_index.item())
+    if end_index is not None:
+        return int(end_index)
+    cache_k = block.get("k")
+    if isinstance(cache_k, torch.Tensor) and cache_k.ndim == 4:
+        return int(cache_k.shape[1])
+    return 0
+
+
+def _block_geometry(block: dict) -> tuple[int, int, int, int]:
+    cache_k = block.get("k")
+    if isinstance(cache_k, torch.Tensor) and cache_k.ndim == 4 and cache_k.shape[1] > 0:
+        batch_size, _, num_heads, head_dim = cache_k.shape
+        return int(batch_size), int(num_heads), int(head_dim), int(cache_k.element_size())
+    dtype = block.get("dtype", torch.bfloat16)
+    return (
+        int(block.get("batch_size", 0)),
+        int(block.get("num_heads", 0)),
+        int(block.get("head_dim", 0)),
+        int(torch.empty((), dtype=dtype).element_size()),
+    )
+
+
 def resident_kv_memory_bytes(pipeline, quantizer=None) -> tuple[int, int]:
-    """Return BF16 and compressed bytes for the resident cache capacity."""
+    """BF16 equivalent and resident bytes under ``resident_analytic.v1``.
+
+    The equivalent is the BF16 cost of the cache positions actually held, the
+    same figure the QVG breakdown and the Self-Forcing record report, so every
+    method and the BF16 row answer the same question.  Counting the
+    preallocated capacity instead tied the ratio to the cache allocation: a
+    run whose window differed from its video length reported a compression
+    ratio that had nothing to do with the quantizer.
+    """
     bf16_bytes = 0
-    compressed_bytes = 0
+    resident_bytes = 0
     for cache_list in _cache_lists(pipeline):
         for block in cache_list:
-            cache_k = block.get("k")
-            if isinstance(cache_k, torch.Tensor) and cache_k.ndim == 4:
-                batch_size, tensor_capacity, num_heads, head_dim = cache_k.shape
-                element_size = cache_k.element_size()
-            else:
-                tensor_capacity = 0
-                batch_size = int(block.get("batch_size", 0))
-                num_heads = int(block.get("num_heads", 0))
-                head_dim = int(block.get("head_dim", 0))
-                dtype = block.get("dtype", torch.bfloat16)
-                element_size = torch.empty((), dtype=dtype).element_size()
-
-            configured_capacity = block.get("kv_cache_size")
-            capacity_tokens = int(
-                tensor_capacity if configured_capacity is None else configured_capacity
+            tokens = _resident_tokens(block)
+            batch_size, num_heads, head_dim, element_size = _block_geometry(block)
+            block_bf16_bytes = (
+                batch_size * tokens * num_heads * head_dim * element_size * 2
             )
-            block_bf16_bytes = batch_size * capacity_tokens * num_heads * head_dim * element_size * 2
             bf16_bytes += block_bf16_bytes
             state = block.get("quant_state")
             if quantizer is not None:
                 if state is not None:
-                    compressed_bytes += int(quantizer.memory_bytes(state))
+                    resident_bytes += int(quantizer.memory_bytes(state))
             else:
-                compressed_bytes += block_bf16_bytes
-    return int(bf16_bytes), int(compressed_bytes)
+                resident_bytes += block_bf16_bytes
+    return int(bf16_bytes), int(resident_bytes)
 
 
 def active_kv_memory_bytes(pipeline, quantizer=None) -> tuple[int, int]:

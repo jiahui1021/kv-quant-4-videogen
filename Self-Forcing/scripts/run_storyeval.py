@@ -34,7 +34,7 @@ from utils.misc import set_seed
 def parse_method(
     method: str,
     bits: int | None,
-    block_size: int,
+    block_size: int | None,
     kivi_residual_length: int | None = None,
 ):
     method = method.upper()
@@ -642,7 +642,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run StoryEval (T2V only) on Self-Forcing-Wan-1.3B.")
     parser.add_argument("--method", type=str, default="BF16", help="BF16, RTN_INT4, RTN_INT2, KIVI_INT4, KIVI_INT2, QUAROT_KV_INT4")
     parser.add_argument("--bits", type=int, default=None, help="Optional bit-width when using method names RTN/KIVI/QUAROT_KV")
-    parser.add_argument("--block_size", type=int, default=16)
+    parser.add_argument(
+        "--block_size",
+        type=int,
+        default=None,
+        help=(
+            "Override every method's group size; unset keeps each baseline at "
+            "its published setting"
+        ),
+    )
     parser.add_argument(
         "--kivi-residual-length",
         type=int,

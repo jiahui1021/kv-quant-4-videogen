@@ -66,7 +66,7 @@ parser.add_argument(
 parser.add_argument(
     "--block_size",
     type=int,
-    default=16,
+    default=None,
     help=(
         "Legacy group-size shortcut: RTN uses it for channel groups; KIVI "
         "uses it for key sequence groups and value channel groups"
@@ -382,7 +382,7 @@ def _write_metrics(
     device: torch.device,
     start_time: float,
     output_folder: str,
-    block_size: int,
+    block_size: int | None,
     benchmark_config: dict[str, object],
 ) -> None:
     torch.cuda.synchronize(device)
@@ -406,7 +406,7 @@ def _write_metrics(
     report = {
         "model": "causal_forcing",
         "method": method_name,
-        "block_size": None if is_qvg else int(block_size),
+        "block_size": None if is_qvg or block_size is None else int(block_size),
         "bits": (
             int(pipeline.qvg_config.bits)
             if is_qvg

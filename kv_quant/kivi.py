@@ -15,7 +15,14 @@ from .incremental import (
     tensor_bytes,
 )
 from .packing import packed_bytes
-from .utils import _reshape_blocks, _unshape_blocks, dequantize_asym, quantize_asym, timed
+from .utils import (
+    SCALE_STORAGE_BYTES,
+    _reshape_blocks,
+    _unshape_blocks,
+    dequantize_asym_min_offset,
+    quantize_asym_min_offset,
+    timed,
+)
 
 
 class KIVIQuantizer(KVQuantizer):
@@ -27,17 +34,21 @@ class KIVIQuantizer(KVQuantizer):
     residual and migrates only complete sequence blocks.
 
     Official KIVI (``models/llama_kivi.py``) quantizes ``key_states`` after
-    ``apply_rotary_pos_emb``, so integrations must cache post-RoPE keys.
+    ``apply_rotary_pos_emb``, so integrations must cache post-RoPE keys.  The
+    The defaults are the paper's: group size 32, a 128-token BF16 residual,
+    and a BF16 scale and minimum per group.
     """
 
     cache_space = "post_rope"
     #: Implements init_state/append_kv/materialize_kv for an append-only cache.
     supports_incremental_cache = True
+    #: Recent tokens KIVI keeps in BF16 (paper: 128).
+    DEFAULT_RESIDUAL_LENGTH = 128
 
     def __init__(
         self,
         bits: int = 4,
-        block_size: int = 16,
+        block_size: int = 32,
         key_bits: int | None = None,
         value_bits: int | None = None,
         name: str | None = None,
@@ -50,7 +61,17 @@ class KIVIQuantizer(KVQuantizer):
         key_group_size = block_size if key_group_size is None else int(key_group_size)
         if key_group_size <= 0:
             raise ValueError("key_group_size must be > 0")
-        residual_length = key_group_size if residual_length is None else int(residual_length)
+        # KIVI keeps a full residual window, not one group: the paper runs
+        # group size 32 with 128 recent tokens in BF16.  A group that does not
+        # divide 128 rounds up, because the residual must stay a whole number
+        # of groups.
+        if residual_length is None:
+            residual_length = (
+                math.ceil(self.DEFAULT_RESIDUAL_LENGTH / key_group_size)
+                * key_group_size
+            )
+        else:
+            residual_length = int(residual_length)
         if residual_length < 0:
             raise ValueError("residual_length must be >= 0")
         if residual_length % key_group_size != 0:
@@ -84,19 +105,17 @@ class KIVIQuantizer(KVQuantizer):
     def _quantize_keys(self, x: torch.Tensor) -> Dict[str, Any]:
         xb, pad_len = _reshape_blocks(x, self.key_group_size)
         # KIVI K: per channel across the sequence tokens in each block.
-        q, scale, zero = quantize_asym(
+        q, scale, zero = quantize_asym_min_offset(
             xb,
             bits=self.key_bits,
             reduce_dims=(2,),
-            parameter_dtype=x.dtype,
         )
         if pad_len:
             valid_tokens = self.key_group_size - pad_len
-            tail_q, tail_scale, tail_zero = quantize_asym(
+            tail_q, tail_scale, tail_zero = quantize_asym_min_offset(
                 xb[:, -1:, :valid_tokens],
                 bits=self.key_bits,
                 reduce_dims=(2,),
-                parameter_dtype=x.dtype,
             )
             q[:, -1:, :valid_tokens] = tail_q
             q[:, -1:, valid_tokens:] = 0
@@ -129,11 +148,10 @@ class KIVIQuantizer(KVQuantizer):
         groups = d // group_size
         xg = x.reshape(b, length, h, groups, group_size)
         # KIVI V: each token/head/channel-group has its own scale/min-offset.
-        q, scale, zero = quantize_asym(
+        q, scale, zero = quantize_asym_min_offset(
             xg,
             bits=self.value_bits,
             reduce_dims=(-1,),
-            parameter_dtype=x.dtype,
         )
         return {
             "q": pack_bits_rows(q, self.value_bits, signed=False, row_dims=2),
@@ -173,7 +191,7 @@ class KIVIQuantizer(KVQuantizer):
                     signed=bool(state.get("signed", False)),
                 )
         dtype = state.get("tensor_dtype", torch.bfloat16)
-        x = dequantize_asym(q, state["scale"], state["zero"], dtype=dtype)
+        x = dequantize_asym_min_offset(q, state["scale"], state["zero"], dtype=dtype)
         return _unshape_blocks(x, int(state["pad_len"]), int(state["orig_shape"][1]))
 
     def _dequantize_values(self, state: Dict[str, Any]) -> torch.Tensor:
@@ -204,7 +222,7 @@ class KIVIQuantizer(KVQuantizer):
             blocks = (length + key_group_size - 1) // key_group_size
             group_size = int(state["value_group_size"])
             groups = d // group_size
-            xg = dequantize_asym(
+            xg = dequantize_asym_min_offset(
                 q,
                 state["scale"],
                 state["zero"],
@@ -219,7 +237,7 @@ class KIVIQuantizer(KVQuantizer):
         b, length, h, d = shape
         group_size = int(state["value_group_size"])
         groups = d // group_size
-        xg = dequantize_asym(q, state["scale"], state["zero"], dtype=state.get("tensor_dtype", torch.bfloat16))
+        xg = dequantize_asym_min_offset(q, state["scale"], state["zero"], dtype=state.get("tensor_dtype", torch.bfloat16))
         return xg.reshape(b, length, h, groups * group_size)
 
     @staticmethod
@@ -748,9 +766,11 @@ class KIVIQuantizer(KVQuantizer):
             * quantized_v
             * packed_bytes(num_heads * head_dim, self.value_bits)
         )
-        key_params = batch_size * key_blocks * num_heads * head_dim * 2 * 2
+        # A BF16 scale and a BF16 minimum, as the reference stores them.
+        param_bytes = 2 * SCALE_STORAGE_BYTES
+        key_params = batch_size * key_blocks * num_heads * head_dim * param_bytes
         value_params = (
-            batch_size * quantized_v * num_heads * value_groups * 2 * 2
+            batch_size * quantized_v * num_heads * value_groups * param_bytes
         )
         residual_values = (
             (active_tokens - quantized_k) + (active_tokens - quantized_v)

@@ -35,7 +35,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint-path", type=Path, required=True)
     parser.add_argument("--prompt-path", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--block-size", type=int, default=16)
+    parser.add_argument(
+        "--block-size",
+        type=int,
+        default=None,
+        help="Override RTN's channel group; unset keeps the paper setting (128)",
+    )
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--use-ema", action="store_true")
     parser.add_argument("--low-memory", action="store_true")
@@ -64,8 +69,6 @@ def command(args: argparse.Namespace) -> list[str]:
         str(latent_frames),
         "--method",
         args.method,
-        "--block-size",
-        str(args.block_size),
         "--local-attn-size",
         str(latent_frames),
         "--max-prompts",
@@ -76,6 +79,8 @@ def command(args: argparse.Namespace) -> list[str]:
         "--paper-latency-phase",
         args.phase,
     ]
+    if args.block_size is not None:
+        result.extend(("--block-size", str(args.block_size)))
     if args.use_ema:
         result.append("--use-ema")
     if args.low_memory:
@@ -119,7 +124,7 @@ def validate_environment(args: argparse.Namespace) -> None:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     validate_environment(args)
-    if args.block_size <= 0:
+    if args.block_size is not None and args.block_size <= 0:
         raise ValueError("--block-size must be positive")
     args.output_dir.expanduser().resolve().mkdir(parents=True, exist_ok=True)
     completed = subprocess.run(command(args), cwd=REPO_ROOT, env=os.environ.copy())

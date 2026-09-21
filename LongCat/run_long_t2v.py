@@ -121,7 +121,7 @@ def _write_generation_metrics(args, dit, device, start_time: float, prompt_idx: 
     report = {
         "model": "longcat",
         "method": method,
-        "block_size": int(args.block_size),
+        "block_size": None if args.block_size is None else int(args.block_size),
         "bits": None if method == "BF16" else int(method.rsplit("INT", 1)[1]),
         "end_to_end_generation_time_s": float(wall_clock_runtime_s),
         "wall_clock_runtime_s": float(wall_clock_runtime_s),
@@ -887,8 +887,13 @@ def _parse_args():
     quant_group.add_argument(
         "--block_size",
         type=int,
-        default=16,
-        help="Sequence block size for shared RTN/KIVI/QuaRot KV quantization",
+        default=None,
+        help=(
+            "Override the quantization group size for every method.  Unset "
+            "keeps each baseline at its published setting: RTN channel groups "
+            "of 128, KIVI group 32 with a 128-token BF16 residual, QuaRot one "
+            "head_dim group."
+        ),
     )
     quant_group.add_argument(
         "--kv_channel_group_size",

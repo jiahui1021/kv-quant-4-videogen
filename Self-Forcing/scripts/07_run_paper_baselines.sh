@@ -15,7 +15,9 @@ GPU_ID="${GPU_ID:-0}"
 MAX_PROMPTS="${MAX_PROMPTS:-60}"
 NUM_OUTPUT_FRAMES="${NUM_OUTPUT_FRAMES:-180}"
 SEED="${SEED:-0}"
-BLOCK_SIZE="${BLOCK_SIZE:-16}"
+# Unset keeps every baseline at its own published grouping; a number here is a
+# matched-granularity ablation, not the paper rows.
+BLOCK_SIZE="${BLOCK_SIZE:-}"
 PROMPT_FILE="${PROMPT_FILE:-${ROOT_DIR}/prompts/moviegen_128.txt}"
 
 # Where the existing BF16 videos live.  Defaults to this run root, which is
@@ -64,13 +66,15 @@ fi
 for method in "${METHODS[@]}"; do
   echo "===== generate ${method} ====="
   extra_args=()
+  if [[ -n "${BLOCK_SIZE}" ]]; then
+    extra_args+=(--block-size "${BLOCK_SIZE}")
+  fi
   if [[ "${method}" == "QUAROT_KV_INT2" && -n "${QUAROT_INT2_ARGS}" ]]; then
     # shellcheck disable=SC2206
-    extra_args=(${QUAROT_INT2_ARGS})
+    extra_args+=(${QUAROT_INT2_ARGS})
   fi
   CUDA_VISIBLE_DEVICES="${GPU_ID}" "${INFER_PYTHON}" "${ROOT_DIR}/scripts/01_generate.py" \
     --method "${method}" \
-    --block-size "${BLOCK_SIZE}" \
     --seed "${SEED}" \
     --device cuda:0 \
     --use-ema \

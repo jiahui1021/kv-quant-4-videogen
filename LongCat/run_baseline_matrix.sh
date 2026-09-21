@@ -24,7 +24,6 @@ for method in "${METHODS[@]}"; do
     --workload 480p_long_gen \
     --context_parallel_size 1 \
     --method "${method}" \
-    --block_size 16 \
     --quant_type none \
     --no_offload_kv_cache \
     --checkpoint_dir "${CHECKPOINT_DIR}" \

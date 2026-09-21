@@ -20,11 +20,25 @@ from .incremental import (
     state_memory_bytes,
 )
 from .packing import packed_bytes
-from .utils import dequantize_sym, quantize_sym, reshape_channel_groups, timed
+from .utils import (
+    COMPARISON_GROUP_SIZE,
+    SCALE_STORAGE_BYTES,
+    ZERO_STORAGE_BYTES,
+    dequantize_asym,
+    quantize_asym,
+    reshape_channel_groups,
+    timed,
+)
 
 
 class RTNQuantizer(KVQuantizer):
-    """Blockwise symmetric RTN with an append-only cache representation."""
+    """Group-wise per-token asymmetric RTN over an append-only cache.
+
+    This is the RTN row of the comparison: round to nearest over channel groups
+    of 64, asymmetric, no rotation.  QuaRot runs the same quantizer on
+    Hadamard-rotated keys and values, so the two rows differ only by the
+    rotation.
+    """
 
     #: Implements init_state/append_kv/materialize_kv for an append-only cache.
     supports_incremental_cache = True
@@ -32,7 +46,7 @@ class RTNQuantizer(KVQuantizer):
     def __init__(
         self,
         bits: int = 4,
-        block_size: int = 16,
+        block_size: int = COMPARISON_GROUP_SIZE,
         key_bits: int | None = None,
         value_bits: int | None = None,
         name: str | None = None,
@@ -57,19 +71,24 @@ class RTNQuantizer(KVQuantizer):
         )
         self.channel_group_size = channel_group_size
 
+    def _resolve_group(self, head_dim: int) -> int:
+        """Channels per scale, narrowed to ``head_dim`` when it is smaller."""
+        return int(min(self.channel_group_size, head_dim))
+
     def _quantize_tensor(self, x: torch.Tensor, bits: int) -> Dict[str, Any]:
-        xg = reshape_channel_groups(x, self.channel_group_size)
-        q, scale = quantize_sym(xg, bits=bits, reduce_dims=(-1,))
+        xg = reshape_channel_groups(x, self._resolve_group(int(x.shape[-1])))
+        q, scale, zero = quantize_asym(xg, bits=bits, reduce_dims=(-1,))
         return {
-            "q": pack_bits(q, bits, signed=True),
+            "q": pack_bits(q, bits, signed=False),
             "q_shape": tuple(q.shape),
             "q_numel": int(q.numel()),
             "packed": True,
-            "signed": True,
+            "signed": False,
             "scale": scale,
+            "zero": zero,
             "orig_shape": tuple(x.shape),
             "bits": bits,
-            "channel_group_size": self.channel_group_size,
+            "channel_group_size": self._resolve_group(int(x.shape[-1])),
             "axis": "token_head_channel_group",
             "tensor_dtype": x.dtype,
         }
@@ -85,17 +104,21 @@ class RTNQuantizer(KVQuantizer):
                 signed=bool(state.get("signed", True)),
             )
         dtype = state.get("tensor_dtype", torch.bfloat16)
-        xg = dequantize_sym(q, state["scale"], dtype=dtype)
+        xg = dequantize_asym(q, state["scale"], state["zero"], dtype=dtype)
         return xg.reshape(tuple(int(dim) for dim in state["orig_shape"]))
 
     def _segment_memory_bytes(self, state: Dict[str, Any]) -> int:
         def bytes_for_tensor(tensor_state: Dict[str, Any]) -> int:
             q = tensor_state["q"]
-            scale = tensor_state["scale"]
             q_bytes = int(q.numel() * q.element_size()) if tensor_state.get("packed", False) else packed_bytes(
                 int(q.numel()), int(tensor_state.get("bits", self.bits))
             )
-            return q_bytes + int(scale.numel() * scale.element_size())
+            total = q_bytes
+            for key in ("scale", "zero"):
+                param = tensor_state.get(key)
+                if isinstance(param, torch.Tensor):
+                    total += int(param.numel() * param.element_size())
+            return total
 
         return bytes_for_tensor(state["k"]) + bytes_for_tensor(state["v"])
 
@@ -246,18 +269,17 @@ class RTNQuantizer(KVQuantizer):
         head_dim: int,
     ) -> int:
         active_tokens = max(int(active_tokens), 0)
-        if head_dim % self.channel_group_size:
+        group = self._resolve_group(head_dim)
+        if head_dim % group:
             raise ValueError(
                 f"head_dim={head_dim} must be divisible by "
-                f"channel_group_size={self.channel_group_size}"
+                f"channel_group_size={group}"
             )
         q_values = batch_size * active_tokens * num_heads * head_dim
         scale_values = (
-            batch_size
-            * active_tokens
-            * num_heads
-            * (head_dim // self.channel_group_size)
+            batch_size * active_tokens * num_heads * (head_dim // group)
         )
-        key_bytes = packed_bytes(q_values, self.key_bits) + scale_values * 2
-        value_bytes = packed_bytes(q_values, self.value_bits) + scale_values * 2
+        param_bytes = scale_values * (SCALE_STORAGE_BYTES + ZERO_STORAGE_BYTES)
+        key_bytes = packed_bytes(q_values, self.key_bits) + param_bytes
+        value_bytes = packed_bytes(q_values, self.value_bits) + param_bytes
         return int(key_bytes + value_bytes)

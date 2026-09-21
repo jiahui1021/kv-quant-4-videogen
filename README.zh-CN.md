@@ -1,158 +1,76 @@
-# LongCat 与 Causal-Forcing 的 KV 量化
+# 视频扩散模型的 KV cache 量化 baseline
 
-本仓库为 LongCat 和 Causal-Forcing 提供统一的 KV-cache 量化实现，支持 RTN、KIVI 和 KV-only QuaRot（按 `spcl/QuaRot` 官方实现移植）；Causal-Forcing 额外提供官方 QVG INT2 和 INT4 baseline。
+在 Self-Forcing、Causal-Forcing、LongCat-Video 上实现 RTN、KIVI、QuaRot 三种 KV cache
+量化，Causal-Forcing 上另有官方 QVG。量化器只有一份，放在 [`kv_quant/`](kv_quant/)，
+三个模型共用。
 
-[English README](README.md)
+## 方法
 
-## 支持的方法
+| 方法 | 量化器 |
+|---|---|
+| `BF16` | 不压缩的对照 |
+| `RTN_INT4` / `RTN_INT2` | per-token 非对称 round-to-nearest，64 通道一组 |
+| `KIVI_INT4` / `KIVI_INT2` | K 按通道在 32 token 一组上量化，V 按 token 量化，保留 128 token 的 BF16 residual |
+| `QUAROT_KV_INT4` / `QUAROT_KV_INT2` | RoPE 之后对 Q/K 做 Hadamard，V 做 head_dim 大小的旋转并在 attention 输出处还原，再按 64 通道一组非对称量化，clip ratio 0.95 |
+| `HADAMARD_K_INT4` / `HADAMARD_K_INT2` | 去掉 V 旋转的 QuaRot，消融用，不作为 baseline |
+| `QVG_INT2` / `QVG_INT4` | 官方 Quant-VideoGen，仅 Causal-Forcing |
 
-| 方法 | 位宽 | 说明 |
-|---|---:|---|
-| `BF16` | 16 | 完整精度 KV cache |
-| `RTN_INT4` / `RTN_INT2` | 4 / 2 | Round-to-nearest 对称量化 |
-| `KIVI_INT4` / `KIVI_INT2` | 4 / 2 | KIVI 风格的 K/V 非对称量化 |
-| `QUAROT_KV_INT4` / `QUAROT_KV_INT2` | 4 / 2 | KV-only QuaRot：RoPE 之后对 Q/K 做同一个 Hadamard 旋转，V 做 head_dim 大小的旋转并在 attention 输出处还原，非对称 per-token、`head_dim` 分组、clip ratio 0.95（论文 KV 设置） |
-| `HADAMARD_K_INT4` / `HADAMARD_K_INT2` | 4 / 2 | 去掉 V 旋转的 QuaRot 消融，不作为 baseline 汇报 |
-| `QVG_INT2` / `QVG_INT4` | 2 / 4 | 官方 Quant-VideoGen semantic smoothing + progressive residual quantization（仅 Causal-Forcing） |
+RTN 和 QuaRot 按论文的存储口径计：每组一个 BF16 scale 加一个 8 bit zero point，所以
+这两行只差一个旋转。KIVI 保留它自己论文的参数化，每 32 个值一个 BF16 scale 加一个
+BF16 最小值，每个值多花半个 bit，换来的是这个方法本身的精度。
 
-共享量化器默认使用 `block_size=16`；QVG 保留官方 `quant_block_size=64` 和每 8 个
-generation chunk 的独立 schedule。LongCat 和 Causal-Forcing 共同调用根目录
-[`kv_quant/`](kv_quant/) 中的共享实现，QVG 专用代码放在 Causal-Forcing adapter 中。
+| | 有效位宽 | 压缩比 |
+|---|---:|---:|
+| RTN、QuaRot INT4 | 4.375 | 3.66× |
+| RTN、QuaRot INT2 | 2.375 | 6.74× |
+| KIVI INT4 | 5.00 | 3.20× |
+| KIVI INT2 | 3.00 | 5.32× |
 
-三个 baseline 各自遵循自己的参考实现，而不是共用一套量化器：RTN 是对称的，KIVI 与
-QuaRot 是非对称的（QuaRot 按论文 KV 设置）；QuaRot 的分组固定为一个 `head_dim`（其
-`QKRotationWrapper` 只接受 token-wise 或 `head_dim` 分组），而 RTN 用 `block_size`。
-要在同一粒度下对比 RTN 与 QuaRot，请设置 `--block_size 128`。
+`--block_size` 可以统一改所有方法的分组，`--kv_channel_group_size 128` 把 QuaRot 切回
+它自己论文的 KV 设置。全程不用 FP8，因为跑实验的 A100 不支持。
 
-QuaRot 需要 post-RoPE 的 key，因此 Causal-Forcing 把它路由到专用的
-`_attention_with_quarot_cache`，而不是共享的 pre-RoPE 缓存路径；Self-Forcing 的 patch
-也和 KIVI 一样只追加不重量化（clip ratio 小于 1 时反复重量化历史会让量程每次去噪都缩小）。
+## 生成协议
 
-QuaRot 默认采用论文的 KV 设置（第 5 节："asymmetric quantization with a group size 128
-with a constant clipping ratio of 0.95"；分组为一个 `head_dim`，Wan 与 LongCat 均为 128）。
-CLI 旋钮：`--kv_asym/--no-kv_asym`（官方 `--k_asym`/`--v_asym`）、`--kv_clip_ratio`
-（官方 `--k_clip_ratio`/`--v_clip_ratio`），另有 `--kv_channel_group_size` 用于切到
-token-wise（`-1`）分组。它们只对旋转后端有效，RTN / KIVI 传入会直接报错而不是静默忽略。
+prompt、种子、注意力窗口、帧数都和 Tempokv、QVG 的 runner 对齐，三个仓库的视频可以直接
+比较：MovieGen-128 prompt、噪声种子 `seed + prompt_index * 1000003`、全历史注意力、
+180 个 latent 帧（16fps 下 717 帧）。
 
-INT2 沿用同一设置，与论文附录 A.3 的 KV cache 消融一致（group-wise 非对称，group size
-128）。官方真实 packing 与 CUDA kernel 只有 `i4`，因此 INT2 QuaRot 是 fake-quant 精度
-加本仓库的 bit packing。
-
-
-## 目录结构
+## 目录
 
 ```text
-kv-quant-4-videogen/
-├── kv_quant/                         # 共享 RTN/KIVI/QuaRot 实现
-├── LongCat/
-│   ├── kv_quant_adapter.py           # LongCat [B,H,S,D] layout 适配器
-│   ├── run_long_t2v.py               # LongCat 生成入口
-│   └── run_baseline_matrix.sh        # 批量运行共享的 7 种方法
-├── Causal-Forcing/
-│   ├── kv_quant_runtime.py           # Causal cache 初始化与 reset
-│   ├── inference.py                  # Causal 生成入口
-│   ├── qvg_runtime.py                # 官方 QVG adapter 与 schedule
-│   └── run_baseline_matrix.sh        # 运行共享方法和 QVG_INT2/INT4
-├── third_party/Quant-VideoGen/       # 固定版本的官方 QVG codec
-└── Self-Forcing/                     # 原有 Self-Forcing 实现
+kv_quant/                     三个模型共用的量化器
+Self-Forcing/scripts/         生成、评测、汇总
+Causal-Forcing/               集成、inference.py、批量脚本
+LongCat/                      集成、run_long_t2v.py、批量脚本
+scripts/paper_experiments/    efficiency 与 latency
+third_party/Quant-VideoGen/   QVG 官方代码
 ```
 
-## 环境要求
-
-视频生成需要 Linux、NVIDIA GPU、支持 CUDA 的 PyTorch，以及两个原始模型项目所需的依赖。
-
-### Causal-Forcing 环境
+## 安装
 
 ```bash
-cd Causal-Forcing
-conda create -n kv-quant python=3.10 -y
-conda activate kv-quant
-pip install -r requirements.txt
-pip install git+https://github.com/openai/CLIP.git
-pip install flash-attn --no-build-isolation
-python setup.py develop
-cd ..
+pip install -r Self-Forcing/requirements-inference.txt   # 生成
+pip install -r Self-Forcing/requirements-eval.txt        # VBench 与保真度
+pip install -r Causal-Forcing/requirements.txt           # Causal-Forcing
+pip install -r Causal-Forcing/requirements-qvg.txt       # 仅 QVG
 ```
 
-LongCat 还需要原始运行环境中的 `diffusers`、`transformers`、`accelerate`、`safetensors`、`einops`、`triton`、`torchvision`、`Pillow`、`loguru`、`ftfy`、`regex`、`openai` 和 `termcolor`。请安装与当前 CUDA、PyTorch 相匹配的版本。
-
-LongCat 源码会导入已有的 `quant_videogen` 运行时。如果该运行时放在当前仓库之外，需要在运行前设置：
+## Self-Forcing
 
 ```bash
-export PYTHONPATH=/path/to/Quant-VideoGen:$PYTHONPATH
-```
-
-这里的路径必须指向包含 `quant_videogen/` 的目录。
-
-## LongCat 使用方法
-
-### 1. 生成统一的初始视频
-
-LongCat continuation 实验必须让所有方法使用同一个初始视频。先用 `BF16` 生成一次，后续方法都复用这个文件：
-
-```bash
-torchrun --nproc_per_node=1 LongCat/run_long_t2v.py \
-  --workload 480p_init \
-  --context_parallel_size 1 \
-  --method BF16 \
-  --block_size 16 \
-  --quant_type none \
-  --checkpoint_dir /path/to/LongCat-checkpoint \
-  --output_dir results/longcat_init \
-  --prompt "A person walking through a sunlit forest"
-```
-
-默认 `--prompt_idx 0`、`--seed 0` 时，初始视频位置为 `results/longcat_init/0-0.mp4`。
-
-### 2. 运行单个方法
-
-```bash
-torchrun --nproc_per_node=1 LongCat/run_long_t2v.py \
-  --workload 480p_long_gen \
-  --context_parallel_size 1 \
+python Self-Forcing/scripts/01_generate.py \
   --method RTN_INT4 \
-  --block_size 16 \
-  --quant_type none \
-  --no_offload_kv_cache \
-  --checkpoint_dir /path/to/LongCat-checkpoint \
-  --init_video_path results/longcat_init/0-0.mp4 \
-  --num_segments 8 \
-  --num_frames 93 \
-  --num_cond_frames 53 \
-  --seed 0 \
-  --output_dir results/longcat/RTN_INT4 \
-  --prompt "A person walking through a sunlit forest"
+  --checkpoint-path /path/to/self_forcing_dmd.pt \
+  --results-root results
 ```
 
-只替换 `--method` 即可比较 7 种共享 baseline。prompt、seed、初始视频、帧数设置和 context parallel 设置必须保持一致。
-
-显存不足时可以把 `--no_offload_kv_cache` 换成 `--offload_kv_cache`。
-
-共享方法不能和 LongCat 原有的 `--quant_type` 同时使用。7 种方法都应设置 `--quant_type none`。下面的组合无效：
+在已有 BF16 run 的基础上跑完六行 INT4 / INT2：
 
 ```bash
---method RTN_INT2 --quant_type naive-int2
+BF16_DIR=results/videos/BF16 bash Self-Forcing/scripts/07_run_paper_baselines.sh
 ```
 
-### 3. 批量运行 LongCat baseline
-
-```bash
-CHECKPOINT_DIR=/path/to/LongCat-checkpoint \
-INIT_VIDEO_PATH=results/longcat_init/0-0.mp4 \
-OUTPUT_ROOT=results/longcat \
-NPROC_PER_NODE=1 \
-bash LongCat/run_baseline_matrix.sh
-```
-
-脚本会依次运行：
-
-```text
-BF16 RTN_INT4 RTN_INT2 KIVI_INT4 KIVI_INT2 QUAROT_KV_INT4 QUAROT_KV_INT2
-```
-
-## Causal-Forcing 使用方法
-
-### 1. 运行单个方法
+## Causal-Forcing
 
 ```bash
 python Causal-Forcing/inference.py \
@@ -161,106 +79,42 @@ python Causal-Forcing/inference.py \
   --data_path Self-Forcing/prompts/moviegen_128.txt \
   --output_folder results/causal_forcing/RTN_INT4 \
   --num_output_frames 180 \
-  --method RTN_INT4 \
-  --block_size 16
+  --method RTN_INT4
 ```
 
-`--num_output_frames` 是 latent 帧数；180 latent 帧对应 717 像素帧
-（44.8s @ 16fps），与长视频 causal_forcing 结果对齐。
+批量：`CONFIG_PATH=... CHECKPOINT_PATH=... DATA_PATH=... bash
+Causal-Forcing/run_baseline_matrix.sh`。QVG 用单独的 `run_qvg.sh`，需要
+`requirements-qvg.txt`。
 
-文生视频使用 `Self-Forcing/prompts/moviegen_128.txt`，与 Tempokv、QVG 的 MovieGen-128 相同；
-`--local_attn_size` 不设或设为 -1 时保留全部历史，与 Tempokv 一致。图生视频使用 `--i2v`，并传入原 Causal-Forcing loader 支持的图像 prompt 数据集。
+## LongCat
 
-frame-wise 和 chunk-wise 模型通过 `--config_path` 选择，量化参数保持不变。
-
-### 2. QVG_INT2 / QVG_INT4
-
-安装 [`Causal-Forcing/requirements-qvg.txt`](Causal-Forcing/requirements-qvg.txt)
-中的依赖后，直接运行 launcher：
+所有续写都从同一个初始视频开始：
 
 ```bash
-CHECKPOINT_PATH=/path/to/causal_forcing.pt \
-DATA_PATH=Self-Forcing/prompts/moviegen_128.txt \
-bash Causal-Forcing/run_qvg.sh
+torchrun --nproc_per_node=1 LongCat/run_long_t2v.py \
+  --workload 480p_init --method BF16 --quant_type none \
+  --checkpoint_dir /path/to/LongCat-checkpoint \
+  --output_dir results/longcat_init \
+  --prompt "A person walking through a sunlit forest"
+
+torchrun --nproc_per_node=1 LongCat/run_long_t2v.py \
+  --workload 480p_long_gen --method RTN_INT4 --quant_type none \
+  --no_offload_kv_cache \
+  --checkpoint_dir /path/to/LongCat-checkpoint \
+  --init_video_path results/longcat_init/0-0.mp4 \
+  --num_segments 8 --seed 0 \
+  --output_dir results/longcat/RTN_INT4 \
+  --prompt "A person walking through a sunlit forest"
 ```
 
-默认运行 QVG_INT2；设置 `METHOD=QVG_INT4` 可运行 INT4。launcher 默认使用正式
-chunkwise workload：717 pixel frames、180 latent frames、180-frame full-history attention，
-仅支持 T2V。
+行与行之间只改 `--method`。批量脚本是 `LongCat/run_baseline_matrix.sh`。
 
-### 3. 批量运行 Causal-Forcing baseline
+## 指标
 
-```bash
-CONFIG_PATH=Causal-Forcing/configs/causal_forcing_dmd_chunkwise.yaml \
-CHECKPOINT_PATH=/path/to/causal_forcing.pt \
-DATA_PATH=Self-Forcing/prompts/moviegen_128.txt \
-OUTPUT_ROOT=results/causal_forcing \
-bash Causal-Forcing/run_baseline_matrix.sh
-```
+每次运行都会写出运行时间、峰值显存和 cache 字节：Self-Forcing 写
+`metrics/efficiency_<METHOD>.json`，另外两个模型每次运行写一份 report。压缩比用
+`resident_analytic.v1` 口径：分子是当前真正持有的 cache 位置换成 BF16 的字节数，分母是
+同一时刻的常驻字节，不是预分配的容量。
 
-checkpoint 包含 EMA 权重时设置 `USE_EMA=1`；正式 launcher 默认使用普通
-`generator` 权重，与 Tempokv launcher 保持一致。
-只有需要量化器 CUDA event 分解时才设置 `PROFILE_QUANT_TIMING=1`；为保证 latency
-公平比较，默认关闭。
-
-## 生成指标
-
-每个完成的视频都会写入 JSON，至少包含：
-
-```json
-{
-  "method": "RTN_INT4",
-  "end_to_end_generation_time_s": 0.0,
-  "peak_vram_bytes": 0,
-  "peak_vram_gb": 0.0,
-  "quantize_calls": 0,
-  "dequantize_calls": 0
-}
-```
-
-LongCat 指标位置：
-
-```text
-<output_dir>/<prompt_idx>-<seed>/metrics_<method>.json
-```
-
-Causal-Forcing 指标位置：
-
-```text
-<output_folder>/metrics_<method>_<prompt_idx>.json
-```
-
-`diffusion_generation_s` 是公平比较的主延迟指标：从自回归 denoising loop 开始，
-到最后一个 clean refresh 完成结束，不包含 VAE decode。`end_to_end_generation_time_s`
-保留用于兼容旧结果，并包含 VAE decode。`peak_vram_bytes` 是该视频生成过程中的最高
-CUDA 已分配显存。量化方法如果从未实际触发量化，会直接报错，避免把 BF16 结果误标成量化结果。
-
-为避免影响 latency benchmark，量化器的逐次耗时统计默认关闭，不会在每次量化或反量化时插入同步或事件开销。需要查看 CUDA event 耗时分解时再显式开启：
-
-```bash
---profile_quant_timing        # LongCat 和 Causal-Forcing
---profile-quant-timing        # Self-Forcing
-```
-
-Causal-Forcing 通用 baseline 按 resident cache capacity 统计；QVG 额外分别报告
-BF16 chunk、centroid、cluster ID、packed residual、scale 和 zero-point 的物理显存，
-并输出 `resident_total_kv_bytes`、`uncompressed_reference_kv_bytes`、effective bits/value、
-QVG 配置和固定 upstream commit；resident bytes 包含压缩数据和 BF16 尾部。
-effective bits/value 的计算为
-`resident_total_kv_bytes * 8 / resident_logical_kv_values`，表示实际驻留存储，
-不等同于 nominal INT2/INT4 位宽。
-
-## 推荐验证顺序
-
-```text
-BF16 → RTN_INT4 → KIVI_INT4 → QUAROT_KV_INT4 → RTN_INT2 → KIVI_INT2 → QUAROT_KV_INT2 → QVG_INT2 → QVG_INT4
-```
-
-第一阶段固定 `context_parallel_size=1`、关闭 compilation，并让所有方法使用同一个初始视频。基础矩阵通过后，再逐项开启 CPU offload、context parallel、attention sink 和 local attention。
-
-## 常见问题
-
-- `ModuleNotFoundError: quant_videogen`：将包含 `quant_videogen/` 的目录加入 `PYTHONPATH`。
-- `Do not enable shared RTN/KIVI/QuaRot and legacy --quant_type`：设置 `--quant_type none`。
-- `KV quantization was never triggered`：LongCat 使用支持 cache 的 continuation workload；Causal-Forcing 使用 `inference.py`；并确认方法不是 `BF16`。
-- LongCat 显存不足：使用 `--offload_kv_cache`，减少 `--num_segments`，或先只验证一个 segment。
+评测：`02_eval_fidelity.py`（对 BF16 的 PSNR/SSIM/LPIPS）、`03_eval_vbench.sh`、
+`05_summarize_results.py`。
