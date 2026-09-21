@@ -15,19 +15,21 @@
 | `HADAMARD_K_INT4` / `HADAMARD_K_INT2` | 去掉 V 旋转的 QuaRot，消融用，不作为 baseline |
 | `QVG_INT2` / `QVG_INT4` | 官方 Quant-VideoGen，仅 Causal-Forcing |
 
-RTN 和 QuaRot 按论文的存储口径计：每组一个 BF16 scale 加一个 8 bit zero point，所以
-这两行只差一个旋转。KIVI 保留它自己论文的参数化，每 32 个值一个 BF16 scale 加一个
-BF16 最小值，每个值多花半个 bit，换来的是这个方法本身的精度。
+三条 baseline 的量化参数都按同一种方式存：64 个值一组，一个 BF16 scale 加一个 BF16
+zero，每个值半个 bit 的元数据。所以压缩比完全相同，行与行只差量化方法本身。
 
 | | 有效位宽 | 压缩比 |
 |---|---:|---:|
-| RTN、QuaRot INT4 | 4.375 | 3.66× |
-| RTN、QuaRot INT2 | 2.375 | 6.74× |
-| KIVI INT4 | 5.00 | 3.20× |
-| KIVI INT2 | 3.00 | 5.32× |
+| INT4 | 4.50 | 3.56× |
+| INT2 | 2.50 | 6.40× |
+
+KIVI 的 128 token BF16 residual 在 180 帧的 cache 上只多 0.005 bit。
 
 `--block_size` 可以统一改所有方法的分组，`--kv_channel_group_size 128` 把 QuaRot 切回
 它自己论文的 KV 设置。全程不用 FP8，因为跑实验的 A100 不支持。
+
+在 Self-Forcing 的 trace 上实测，压缩比相同时的 attention 输出误差：INT4 是 0.007（KIVI）、
+0.052（QuaRot）、0.064（RTN）；INT2 是 0.107（KIVI）、0.416（QuaRot）、0.532（RTN）。
 
 ## 生成协议
 

@@ -45,18 +45,15 @@ def reshape_channel_groups(x: torch.Tensor, group_size: int) -> torch.Tensor:
     return x.reshape(b, l, h, d // group_size, group_size)
 
 
-#: Quantization parameters are stored the same way for every baseline and for
-#: TempoKV: a BF16 scale and a UINT8 zero point per group.  A row's compression
-#: ratio then reflects its grouping and bit width, not how it happens to encode
-#: its parameters.  FP8 is deliberately not used: the A100s these runs target
-#: have no FP8 support.
+#: Every baseline stores its quantization parameters the same way: a BF16
+#: scale and a BF16 zero per group of 64 values, half a bit per value, the
+#: group the paper's own accounting uses.  A row's compression ratio then reflects its
+#: quantizer rather than how it happens to encode its parameters.  FP8 is
+#: deliberately not used: the A100s these runs target have no FP8 support.
 SCALE_STORAGE_DTYPE = torch.bfloat16
-ZERO_STORAGE_DTYPE = torch.uint8
-#: QuaRot's group-wise branch keeps its own range instead of widening it to
-#: include zero, so its zero point can be negative.  Same eight bits, signed.
-SIGNED_ZERO_STORAGE_DTYPE = torch.int8
+ZERO_STORAGE_DTYPE = torch.bfloat16
 SCALE_STORAGE_BYTES = 2
-ZERO_STORAGE_BYTES = 1
+ZERO_STORAGE_BYTES = 2
 
 #: Channels (or tokens) per scale in the shared comparison setting.
 COMPARISON_GROUP_SIZE = 64
@@ -70,30 +67,6 @@ def round_scale_to_storage(scale: torch.Tensor) -> torch.Tensor:
     rounding error.
     """
     return scale.to(SCALE_STORAGE_DTYPE).to(scale.dtype)
-
-
-def quantize_asym(
-    x: torch.Tensor,
-    bits: int,
-    reduce_dims: Tuple[int, ...],
-):
-    """Asymmetric round-to-nearest with an integer zero point.
-
-    The zero point is the code that reconstructs to zero, which is what the
-    UINT8 field holds; storing the group minimum instead would need a second
-    floating-point tensor.  As in QuaRot's ``find_params``, the range is
-    widened to include zero so that the zero point stays inside the code
-    range.  Reconstruction is ``(q - zero) * scale``.
-    """
-    qmin, qmax = 0, (1 << bits) - 1
-    zeros = torch.zeros_like(x[(slice(None),) * x.ndim])
-    x_min = torch.minimum(x.amin(dim=reduce_dims, keepdim=True), zeros.amin(dim=reduce_dims, keepdim=True))
-    x_max = torch.maximum(x.amax(dim=reduce_dims, keepdim=True), zeros.amax(dim=reduce_dims, keepdim=True))
-    scale = ((x_max - x_min) / max(qmax - qmin, 1)).clamp_min(EPS)
-    scale = round_scale_to_storage(scale)
-    zero = torch.round(-x_min / scale).clamp(qmin, qmax)
-    q = torch.round(x / scale).add(zero).clamp(qmin, qmax).to(torch.int8)
-    return q, scale.to(SCALE_STORAGE_DTYPE), zero.to(ZERO_STORAGE_DTYPE)
 
 
 def quantize_asym_min_offset(
@@ -128,19 +101,6 @@ def dequantize_asym_min_offset(
     out = q.to(dtype, copy=True)
     out.mul_(scale.to(dtype))
     out.add_(minimum.to(dtype))
-    return out
-
-
-def dequantize_asym(
-    q: torch.Tensor,
-    scale: torch.Tensor,
-    zero: torch.Tensor,
-    dtype: torch.dtype = torch.float32,
-) -> torch.Tensor:
-    # In place on one fresh copy: same arithmetic order, one full-size buffer.
-    out = q.to(dtype, copy=True)
-    out.sub_(zero.to(dtype))
-    out.mul_(scale.to(dtype))
     return out
 
 

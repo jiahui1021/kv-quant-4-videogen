@@ -23,8 +23,8 @@ from .utils import (
     COMPARISON_GROUP_SIZE,
     SCALE_STORAGE_BYTES,
     SCALE_STORAGE_DTYPE,
-    SIGNED_ZERO_STORAGE_DTYPE,
     ZERO_STORAGE_BYTES,
+    ZERO_STORAGE_DTYPE,
     fwht_last_dim,
     quarot_dequantize,
     quarot_find_params,
@@ -213,10 +213,10 @@ class QuaRotKVQuantizer(KVQuantizer):
             q[:, start:start + chunk] = quarot_quantize(xg, scale, zero, bits, self.sym)
             scales.append(scale.to(SCALE_STORAGE_DTYPE))
             if not self.sym:
-                zeros.append(zero.clamp(-128, 127).to(SIGNED_ZERO_STORAGE_DTYPE))
+                zeros.append(zero.to(ZERO_STORAGE_DTYPE))
             del xc, xg, scale, zero
         empty_scale = torch.empty((b, 0, groups, 1), dtype=SCALE_STORAGE_DTYPE, device=x.device)
-        empty_zero = torch.empty((b, 0, groups, 1), dtype=SIGNED_ZERO_STORAGE_DTYPE, device=x.device)
+        empty_zero = torch.empty((b, 0, groups, 1), dtype=ZERO_STORAGE_DTYPE, device=x.device)
         state = {
             "q": pack_bits(q, bits, signed=self.sym),
             "q_shape": tuple(q.shape),
@@ -499,7 +499,7 @@ class QuaRotKVQuantizer(KVQuantizer):
         group = self._resolve_group(head_dim, num_heads)
         values = batch_size * active_tokens * num_heads * head_dim
         groups = batch_size * active_tokens * (num_heads * head_dim) // group
-        # A BF16 scale, plus an 8-bit zero point when asymmetric.
+        # A BF16 scale, plus a BF16 zero point when asymmetric.
         param_bytes = groups * (
             SCALE_STORAGE_BYTES + (ZERO_STORAGE_BYTES if self.asym else 0)
         )

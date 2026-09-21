@@ -24,8 +24,8 @@ from .utils import (
     COMPARISON_GROUP_SIZE,
     SCALE_STORAGE_BYTES,
     ZERO_STORAGE_BYTES,
-    dequantize_asym,
-    quantize_asym,
+    dequantize_asym_min_offset,
+    quantize_asym_min_offset,
     reshape_channel_groups,
     timed,
 )
@@ -35,9 +35,9 @@ class RTNQuantizer(KVQuantizer):
     """Group-wise per-token asymmetric RTN over an append-only cache.
 
     This is the RTN row of the comparison: round to nearest over channel groups
-    of 64, asymmetric, no rotation.  QuaRot runs the same quantizer on
-    Hadamard-rotated keys and values, so the two rows differ only by the
-    rotation.
+    of 64, asymmetric, no rotation, with a BF16 scale and a BF16 group minimum.
+    QuaRot runs the same quantizer on Hadamard-rotated keys and values, so the
+    two rows differ only by the rotation.
     """
 
     #: Implements init_state/append_kv/materialize_kv for an append-only cache.
@@ -77,7 +77,7 @@ class RTNQuantizer(KVQuantizer):
 
     def _quantize_tensor(self, x: torch.Tensor, bits: int) -> Dict[str, Any]:
         xg = reshape_channel_groups(x, self._resolve_group(int(x.shape[-1])))
-        q, scale, zero = quantize_asym(xg, bits=bits, reduce_dims=(-1,))
+        q, scale, zero = quantize_asym_min_offset(xg, bits=bits, reduce_dims=(-1,))
         return {
             "q": pack_bits(q, bits, signed=False),
             "q_shape": tuple(q.shape),
@@ -104,7 +104,7 @@ class RTNQuantizer(KVQuantizer):
                 signed=bool(state.get("signed", True)),
             )
         dtype = state.get("tensor_dtype", torch.bfloat16)
-        xg = dequantize_asym(q, state["scale"], state["zero"], dtype=dtype)
+        xg = dequantize_asym_min_offset(q, state["scale"], state["zero"], dtype=dtype)
         return xg.reshape(tuple(int(dim) for dim in state["orig_shape"]))
 
     def _segment_memory_bytes(self, state: Dict[str, Any]) -> int:

@@ -15,22 +15,25 @@ implementation in [`kv_quant/`](kv_quant/), three model integrations.
 | `HADAMARD_K_INT4` / `HADAMARD_K_INT2` | QuaRot without the V rotation; an ablation, not a baseline |
 | `QVG_INT2` / `QVG_INT4` | official Quant-VideoGen, Causal-Forcing only |
 
-RTN and QuaRot are charged the storage the paper's accounting uses, a BF16
-scale and an 8-bit zero point per group, so the two rows differ only by the
-rotation. KIVI keeps its own published parameterisation, a BF16 scale and a
-BF16 minimum per group of 32, which costs it half a bit per value and buys the
-accuracy that is the point of the method.
+Every row stores its quantization parameters the same way: groups of 64
+values with a BF16 scale and a BF16 zero, half a bit of metadata per value.
+The three baselines therefore sit at the same compression and differ only by
+the quantizer.
 
 | | effective bits | compression |
 |---|---:|---:|
-| RTN, QuaRot INT4 | 4.375 | 3.66x |
-| RTN, QuaRot INT2 | 2.375 | 6.74x |
-| KIVI INT4 | 5.00 | 3.20x |
-| KIVI INT2 | 3.00 | 5.32x |
+| INT4 | 4.50 | 3.56x |
+| INT2 | 2.50 | 6.40x |
+
+KIVI's 128-token BF16 residual adds 0.005 bits over a 180-frame cache.
 
 `--block_size` overrides the group size for every method, and
 `--kv_channel_group_size 128` puts QuaRot on its own paper's KV setting. FP8 is
 not used anywhere: the A100s these runs target have no FP8.
+
+Measured on a Self-Forcing trace at matched compression, attention-output
+error: INT4 0.007 (KIVI), 0.052 (QuaRot), 0.064 (RTN); INT2 0.107 (KIVI),
+0.416 (QuaRot), 0.532 (RTN).
 
 ## Generation protocol
 

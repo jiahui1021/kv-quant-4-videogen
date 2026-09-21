@@ -16,6 +16,7 @@ from .incremental import (
 )
 from .packing import packed_bytes
 from .utils import (
+    COMPARISON_GROUP_SIZE,
     SCALE_STORAGE_BYTES,
     _reshape_blocks,
     _unshape_blocks,
@@ -35,8 +36,9 @@ class KIVIQuantizer(KVQuantizer):
 
     Official KIVI (``models/llama_kivi.py``) quantizes ``key_states`` after
     ``apply_rotary_pos_emb``, so integrations must cache post-RoPE keys.  The
-    The defaults are the paper's: group size 32, a 128-token BF16 residual,
-    and a BF16 scale and minimum per group.
+    The group size is the comparison setting's 64 so that every row is charged
+    the same parameter budget; the 128-token BF16 residual and the K/V axes are
+    KIVI's own.  A BF16 scale and a BF16 minimum are stored per group.
     """
 
     cache_space = "post_rope"
@@ -48,7 +50,7 @@ class KIVIQuantizer(KVQuantizer):
     def __init__(
         self,
         bits: int = 4,
-        block_size: int = 32,
+        block_size: int = COMPARISON_GROUP_SIZE,
         key_bits: int | None = None,
         value_bits: int | None = None,
         name: str | None = None,
